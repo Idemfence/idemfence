@@ -11,6 +11,7 @@
  *   integer number of milliseconds or a string matching `/^\d+(ms|s|m|h|d)$/`.
  * - `LEASE_NOT_SHORTER_THAN_RETENTION`: `lease` is greater than or equal to `retention`.
  * - `KEY_MAX_LENGTH_INVALID`: `keyMaxLength` is not an integer from 1 to 255.
+ * - `KEY_SYNTAX_INVALID`: `keySyntax` is not `"sf-string"` or `"sf-string-or-raw"`.
  * - `BODY_CAP_INVALID`: `requestBodyCap` or `responseBodyCap` is not a positive integer.
  * - `RELEASE_STATUS_INVALID`: `releaseStatuses` is not an array of integers from 400 to 599.
  * - `NAMESPACE_INVALID`: `namespace` is not a string of 1 to 64 printable ASCII characters
@@ -30,6 +31,7 @@ export type IdemfenceConfigErrorCode =
   | "DURATION_INVALID"
   | "LEASE_NOT_SHORTER_THAN_RETENTION"
   | "KEY_MAX_LENGTH_INVALID"
+  | "KEY_SYNTAX_INVALID"
   | "BODY_CAP_INVALID"
   | "RELEASE_STATUS_INVALID"
   | "NAMESPACE_INVALID"
@@ -56,6 +58,8 @@ export interface Store {
   release(...args: never[]): unknown;
 }
 
+export type KeySyntax = "sf-string" | "sf-string-or-raw";
+
 /** Positive integer milliseconds, or a string such as `"30s"` (units: ms, s, m, h, d). */
 export type Duration = number | `${number}${"ms" | "s" | "m" | "h" | "d"}`;
 
@@ -69,6 +73,12 @@ export interface IdemfenceOptions<TRequest = unknown> {
   retention?: Duration;
   lease?: Duration;
   keyMaxLength?: number;
+  /**
+   * `"sf-string"` accepts only a Structured Field String. `"sf-string-or-raw"` also accepts an
+   * unquoted key of 0x21 to 0x7E characters (no quotes or backslashes); `abc` and `"abc"` are
+   * the same key.
+   */
+  keySyntax?: KeySyntax;
   requestBodyCap?: number;
   responseBodyCap?: number;
   storeUnavailableRetryAfter?: Duration;
@@ -88,6 +98,7 @@ export interface ResolvedConfig<TRequest = unknown> {
   readonly retention: number;
   readonly lease: number;
   readonly keyMaxLength: number;
+  readonly keySyntax: KeySyntax;
   readonly requestBodyCap: number;
   readonly responseBodyCap: number;
   readonly storeUnavailableRetryAfter: number;
@@ -236,6 +247,7 @@ export function resolveConfig<TRequest>(
     retention,
     lease,
     keyMaxLength,
+    keySyntax: keySyntax(options.keySyntax),
     requestBodyCap: bodyCap("requestBodyCap", options.requestBodyCap),
     responseBodyCap: bodyCap("responseBodyCap", options.responseBodyCap),
     storeUnavailableRetryAfter,
@@ -244,6 +256,17 @@ export function resolveConfig<TRequest>(
     headerAllowlist: headerAllowlist(options.headerAllowlist),
     required: requiredFlag(options.required),
   });
+}
+
+function keySyntax(value: unknown): KeySyntax {
+  const resolved = value ?? "sf-string";
+  if (resolved !== "sf-string" && resolved !== "sf-string-or-raw") {
+    throw new IdemfenceConfigError(
+      "KEY_SYNTAX_INVALID",
+      'Option `keySyntax` must be "sf-string" or "sf-string-or-raw".',
+    );
+  }
+  return resolved;
 }
 
 function namespace(value: unknown): string {
