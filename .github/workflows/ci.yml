@@ -46,6 +46,10 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # After Build: some tests run against the built package in dist/.
+      - name: Test
+        run: pnpm test
+
   licenses:
     name: licenses
     runs-on: ubuntu-latest
