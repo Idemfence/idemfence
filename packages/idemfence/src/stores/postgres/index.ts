@@ -123,17 +123,19 @@ class PostgresStore implements Store {
           ? { outcome: "replay", response: storedResponse(existing) }
           : { outcome: "mismatch" };
       }
+      // A different fingerprint is a reuse (row 7) whether the lease is live or expired: a
+      // 409 would invite a retry that can never succeed, and a takeover would let a different
+      // payload claim a key whose first attempt may already have had side effects.
+      if (!sameFingerprint) {
+        return { outcome: "mismatch" };
+      }
       if (existing.lease_remaining_ms <= 0) {
         continue;
       }
-      // A different fingerprint under a live lease is a reuse (row 7), not a conflict: a 409
-      // would invite a retry that can never succeed.
-      return sameFingerprint
-        ? {
-            outcome: "in_flight",
-            retryAfterMs: Math.ceil(existing.lease_remaining_ms),
-          }
-        : { outcome: "mismatch" };
+      return {
+        outcome: "in_flight",
+        retryAfterMs: Math.ceil(existing.lease_remaining_ms),
+      };
     }
     throw new IdemfenceStoreError(
       "BEGIN_RACE_EXHAUSTED",
@@ -194,7 +196,8 @@ function statements(meta: string, records: string, sequence: string) {
   return {
     version: `SELECT version FROM ${meta}`,
 
-    // A takeover (expired lease, or retention expired) draws a new fencing token so the
+    // A takeover (expired lease with the same fingerprint, or retention expired with no live
+    // lease) draws a new fencing token so the
     // previous holder's later complete/renew/release no longer match. Tokens come from a
     // sequence, so they only grow and are never reused. Retention expiry makes the row a
     // fresh record (attempts and created_at reset); a lease takeover is one more attempt.
@@ -220,15 +223,19 @@ function statements(meta: string, records: string, sequence: string) {
         response_body = NULL,
         body_omitted = false,
         completed_at = NULL
-      WHERE (r.state = 'in_flight' AND r.lease_expires_at <= clock_timestamp())
-         OR r.expires_at <= clock_timestamp()
+      WHERE (r.state = 'in_flight' AND r.lease_expires_at <= clock_timestamp()
+             AND r.fingerprint = EXCLUDED.fingerprint)
+         OR (r.expires_at <= clock_timestamp()
+             AND NOT (r.state = 'in_flight' AND r.lease_expires_at > clock_timestamp()))
       RETURNING fencing_token::text AS fencing_token, attempts`,
 
     classify: `
       SELECT state, fingerprint, response_status, response_headers, response_body, body_omitted,
              GREATEST(0, EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp())) * 1000)::float8
                AS lease_remaining_ms,
-             expires_at <= clock_timestamp() AS retention_expired
+             expires_at <= clock_timestamp()
+               AND NOT (state = 'in_flight' AND lease_expires_at > clock_timestamp())
+               AS retention_expired
       FROM ${records}
       WHERE lookup_key = $1`,
 

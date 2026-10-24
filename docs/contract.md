@@ -145,6 +145,10 @@ Further requirements:
 
 - Rows 7 and 8: a request whose fingerprint differs from an in-flight record's is a reuse
   (row 7, 422), not a conflict (row 8): a 409 would invite a retry that can never succeed.
+- Rows 7 and 9: row 7 takes precedence. A request with a different fingerprint MUST NOT take
+  over an expired lease; the record keeps its fingerprint until retention ends.
+- Rows 9 and 10: a live lease blocks row 10. A lease renewed repeatedly can outlast
+  retention; while it is live, the record MUST NOT be replaced or purged.
 - Row 9: fencing tokens MUST be compared and set atomically by the store on every complete,
   release and renew. A write carrying a stale token MUST change nothing and MUST be reported
   to the caller as fenced.

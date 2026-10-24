@@ -259,6 +259,49 @@ describe("begin", () => {
     );
   });
 
+  it("never lets a different fingerprint take over an expired lease", async () => {
+    const k = key();
+    const first = await acquire(k, fp(), 200);
+    await sleep(350);
+
+    expect(await store.begin(k, fp(1), LEASE, RETENTION)).toStrictEqual({
+      outcome: "mismatch",
+    });
+    expect(await row(k)).toMatchObject({
+      state: "in_flight",
+      attempts: 1,
+      fencing_token: first.fencingToken.toString(),
+    });
+    // The original payload can still retry and take over. (The mismatch above drew a
+    // sequence value too, so the new token is greater, not necessarily by one.)
+    const retry = await acquire(k, fp(), LEASE);
+    expect(retry.fencingToken).toBeGreaterThan(first.fencingToken);
+    expect(retry.attempts).toBe(2);
+  });
+
+  it("does not replace or purge a record whose renewed lease outlasts retention", async () => {
+    const k = key();
+    const { fencingToken } = await acquire(k, fp(), 200, 60_000);
+    expect(await store.renew(k, fencingToken, 5_000)).toBe("renewed");
+    await pool.query(
+      `UPDATE ${records} SET expires_at = clock_timestamp() - interval '1 second' WHERE lookup_key = $1`,
+      [Buffer.from(k)],
+    );
+
+    expect((await store.begin(k, fp(), LEASE, RETENTION)).outcome).toBe(
+      "in_flight",
+    );
+    expect(await store.begin(k, fp(1), LEASE, RETENTION)).toStrictEqual({
+      outcome: "mismatch",
+    });
+    expect(await store.purgeExpired(10)).toBe(0);
+    expect(await row(k)).toMatchObject({
+      state: "in_flight",
+      fencing_token: fencingToken.toString(),
+    });
+    expect(await store.complete(k, fencingToken, response)).toBe("completed");
+  });
+
   it("treats a key past retention as a first request", async () => {
     const k = key();
     const first = await acquire(k, fp(), 100, 250);
@@ -413,6 +456,10 @@ describe("the vanished-row race", () => {
 
 describe("purgeExpired", () => {
   it("deletes at most `limit` expired records and never a live lease", async () => {
+    // Earlier tests may have left records past retention; start from none.
+    while ((await store.purgeExpired(100)) > 0) {
+      // drain
+    }
     const expired: Uint8Array[] = [];
     for (let i = 0; i < 5; i += 1) {
       const k = key();
