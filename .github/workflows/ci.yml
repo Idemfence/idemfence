@@ -116,10 +116,38 @@ jobs:
       - name: Audit dependencies
         run: pnpm audit --audit-level moderate
 
+  reference-app:
+    name: reference-app
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate secrets for this run
+        run: |
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> "$GITHUB_ENV"
+          echo "IDEMFENCE_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+
+      - name: Build and start the stack
+        run: docker compose -f reference-app/compose.yaml up -d --build --wait
+
+      - name: Smoke test
+        run: bash reference-app/smoke.sh
+
+      - name: Show logs on failure
+        if: ${{ failure() }}
+        run: docker compose -f reference-app/compose.yaml logs --no-color
+
+      - name: Tear down
+        if: ${{ always() }}
+        run: docker compose -f reference-app/compose.yaml down -v
+
   ci:
     name: ci
     if: ${{ always() }}
-    needs: [check, licenses, audit]
+    needs: [check, licenses, audit, reference-app]
     runs-on: ubuntu-latest
     steps:
       - name: Require every job to succeed

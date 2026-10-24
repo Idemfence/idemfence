@@ -6,7 +6,7 @@
   "packageManager": "pnpm@12.11.2",
   "scripts": {
     "build": "tsc --build",
-    "typecheck": "tsc --build --noEmit && tsc --project packages/idemfence/test",
+    "typecheck": "tsc --build && tsc --project packages/idemfence/test",
     "test": "vitest run",
     "lint": "biome ci",
     "format": "biome format --write"
