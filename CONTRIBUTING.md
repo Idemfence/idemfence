@@ -40,6 +40,19 @@ Keep your branch current with `git rebase --signoff`, not GitHub's "Update branc
 button: the `dco` check also validates merge commits, and that button creates one
 without a sign-off.
 
+## Running the tests
+
+The store tests run against a real PostgreSQL 18 and fail, rather than skip, when
+`IDEMFENCE_TEST_DATABASE_URL` is unset. Start one with Docker and point the variable at it:
+
+```sh
+docker run --rm -d --name idemfence-postgres -e POSTGRES_PASSWORD=idemfence -p 5432:5432 postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+export IDEMFENCE_TEST_DATABASE_URL=postgres://postgres:idemfence@localhost:5432/postgres
+```
+
+The tests create and drop their own schemas. Some run against the built package, so run
+`pnpm build` before `pnpm test`.
+
 ## Definition of done
 
 A pull request is ready to merge only when all of the following hold:

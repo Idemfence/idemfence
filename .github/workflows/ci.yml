@@ -20,6 +20,23 @@ jobs:
       matrix:
         # Exact releases of every Active/Maintenance LTS line, each published 14+ days ago.
         node: ["22.23.3", "24.21.0"]
+    services:
+      postgres:
+        # postgres:18.4, pushed 2026-08-06; pinned by manifest-list digest.
+        image: postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+        env:
+          POSTGRES_USER: idemfence
+          POSTGRES_PASSWORD: idemfence
+          POSTGRES_DB: idemfence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U idemfence -d idemfence_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      IDEMFENCE_TEST_DATABASE_URL: postgres://idemfence:idemfence@localhost:5432/idemfence_test
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,6 +62,9 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      - name: Apply the Postgres migration
+        run: psql "$IDEMFENCE_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/idemfence/migrations/001_init.sql
 
       # After Build: some tests run against the built package in dist/.
       - name: Test

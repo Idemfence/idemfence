@@ -28,7 +28,8 @@ Terms used below:
 - **Lease**: a time-limited, exclusive claim on an in-flight record, measured on the store's
   clock.
 - **Fencing token**: an integer stored with the record that increases by at least one each
-  time a lease is acquired.
+  time a lease is acquired. A token value is never reused, even after the record is deleted
+  and recreated.
 - **Retention**: how long a record is kept after it is created. It is configured per route
   and MUST be longer than the lease.
 
@@ -129,8 +130,8 @@ row 1; then the key checks (rows 2 and 3); then the principal (row 4); then the 
 | 4  | No principal while scoping is required | 500 [configuration-error](#configuration-error), logged as a configuration error (fail closed). | None. |
 | 5  | First request for the lookup key | The handler runs. A lease is acquired before it starts. | Created in flight; the response is stored per policy (section 5). |
 | 6  | Completed key, same fingerprint | The stored response is replayed with `Idempotent-Replayed: true`. The handler does not run. | Unchanged. |
-| 7  | Completed key, different fingerprint | 422 [key-reused](#key-reused). | Unchanged. |
-| 8  | In-flight key, lease valid | 409 [in-flight](#in-flight) with `Retry-After` set to the remaining lease in whole seconds, rounded up (minimum 1). | Unchanged. |
+| 7  | Key exists (completed or in flight) with a different fingerprint | 422 [key-reused](#key-reused). | Unchanged. |
+| 8  | In-flight key, lease valid, same fingerprint | 409 [in-flight](#in-flight) with `Retry-After` set to the remaining lease in whole seconds, rounded up (minimum 1). | Unchanged. |
 | 9  | In-flight key, lease expired | The handler runs as a new attempt. | The lease is taken over and the fencing token incremented. A late complete, release or renew from the previous holder is rejected. |
 | 10 | Key older than retention | Treated as a first request (row 5). | The old record is replaced. |
 | 11 | Handler status is in the release set (default 408, 425, 429) | The handler's response is returned as-is. | Deleted, so the key can be retried. In transactional mode the handler's transaction is rolled back. 503 is not in the default set because it can follow a side effect. |
@@ -142,6 +143,8 @@ row 1; then the key checks (rows 2 and 3); then the principal (row 4); then the 
 
 Further requirements:
 
+- Rows 7 and 8: a request whose fingerprint differs from an in-flight record's is a reuse
+  (row 7, 422), not a conflict (row 8): a 409 would invite a retry that can never succeed.
 - Row 9: fencing tokens MUST be compared and set atomically by the store on every complete,
   release and renew. A write carrying a stale token MUST change nothing and MUST be reported
   to the caller as fenced.

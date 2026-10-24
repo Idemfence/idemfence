@@ -9,10 +9,22 @@ const SECRET = "test-secret-0123456789-abcdefghijklmnop";
 const SHORT_SECRET = "short-secret-value";
 
 const store = {
-  begin() {},
-  renew() {},
-  complete() {},
-  release() {},
+  async ready() {},
+  async begin() {
+    return { outcome: "mismatch" as const };
+  },
+  async renew() {
+    return "renewed" as const;
+  },
+  async complete() {
+    return "completed" as const;
+  },
+  async release() {
+    return "released" as const;
+  },
+  async purgeExpired() {
+    return 0;
+  },
 };
 const scope = () => "principal-1";
 
