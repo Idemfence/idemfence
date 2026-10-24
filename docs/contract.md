@@ -52,15 +52,25 @@ key can never equal a fingerprint.
 
 1. The `Idempotency-Key` field is an Item Structured Field whose value MUST be a String
    (Section 3.3.3 of [RFC 9651][rfc9651]), as required by Section 2.1 of the draft. For
-   example: `Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"`.
+   example: `Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"`. The field is parsed
+   with the Item algorithm of Section 4.2 of RFC 9651. Parameters on the Item are parsed
+   and ignored. Multiple `Idempotency-Key` field lines are combined into one comma-separated
+   value before parsing, so a request that carries more than one is malformed.
 2. The decoded String MUST be 1 to 255 characters long. The maximum is configurable per
    route.
 3. Every character of the decoded String MUST be printable ASCII (0x20 to 0x7E). A field
    that does not parse as an sf-string, is too long, or contains any other character is
    malformed (row 3).
-4. A configured route requires a key by default. A route MAY be configured with the key
+4. A route MAY set `keySyntax` to `sf-string-or-raw` (the default is `sf-string`). Then a
+   field value that does not start with DQUOTE is accepted as the key as-is if it is 1 to
+   the route's maximum characters, each in 0x21 to 0x7E other than DQUOTE and backslash. A
+   value that starts with DQUOTE is still parsed as in item 1. The raw form `abc` and the
+   quoted form `"abc"` MUST resolve to the same key, and therefore the same lookup key.
+   Rationale: many clients send unquoted keys, including clients following Stripe's
+   documented examples.
+5. A configured route requires a key by default. A route MAY be configured with the key
    optional; a request without a key on such a route is handled as in row 1.
-5. The lookup key is:
+6. The lookup key is:
 
    ```
    SHA-256( enc("idemfence/lookup/v1") || enc(namespace) || enc(principal)
@@ -69,8 +79,8 @@ key can never equal a fingerprint.
 
    where `namespace` is the configured namespace string, `method` is the request method as
    received, `route template` is the configured template (for example `/orders/:id`), and
-   `client key` is the decoded String from the header.
-6. Raw client keys MUST NOT be stored. Only the lookup key is persisted. Raw client keys
+   `client key` is the decoded String from the header (or the raw key, item 4).
+7. Raw client keys MUST NOT be stored. Only the lookup key is persisted. Raw client keys
    SHOULD NOT be logged.
 
 ## 3. Fingerprint
@@ -179,7 +189,10 @@ Further requirements:
 
 Every error that idemfence generates is an `application/problem+json` body
 ([RFC 9457][rfc9457]) with `type`, `title`, `status` and `detail` members, sent with
-`Link: <type-uri>; rel="describedby"`. Responses for row 8 (in both modes), row 14, and
+`Link: <type-uri>; rel="describedby"`. The `type`, `title` and `status` of each problem are
+defined below. The `detail` member is a human-readable explanation whose wording is not
+part of this contract. No member or header of a problem response contains the client's
+key. Responses for row 8 (in both modes), row 14, and
 the transactional-mode 503 in section 5 also carry `Retry-After`.
 
 Every `Retry-After` that idemfence emits is delay-seconds (Section 10.2.3 of
@@ -194,23 +207,34 @@ tag of the installed version. A 500 for a handler throw (rows 12 and 13) uses th
 
 ### key-missing
 
+Title: "Idempotency-Key is missing".
+
 400. The route requires an `Idempotency-Key` and the request has none. Row 2.
 
 ### key-malformed
 
-400. The `Idempotency-Key` is not an sf-string, is longer than the route's maximum, or
-contains characters outside 0x20 to 0x7E. Row 3.
+Title: "Idempotency-Key is malformed".
+
+400. The `Idempotency-Key` is not an sf-string (or, with `keySyntax` `sf-string-or-raw`,
+a valid raw key), is longer than the route's maximum, contains characters outside 0x20 to
+0x7E, or is sent more than once. Row 3.
 
 ### key-reused
+
+Title: "Idempotency-Key is already used".
 
 422. The key was already used with a request whose fingerprint differs. Row 7.
 
 ### in-flight
 
+Title: "A request is outstanding for this Idempotency-Key".
+
 409. A request with the same key is still being processed. Retry after the number of
 seconds in `Retry-After`. Row 8.
 
 ### store-unavailable
+
+Title: "Idempotency store is unavailable".
 
 503. The idempotency store could not be reached (row 14), or, in transactional mode, the
 record could not be written with the handler's transaction (section 5). Retry after the
@@ -218,9 +242,13 @@ number of seconds in `Retry-After`.
 
 ### body-too-large
 
+Title: "Request body is too large".
+
 413. The request body exceeds the route's fingerprint cap. Row 15.
 
 ### configuration-error
+
+Title: "Idempotency middleware is misconfigured".
 
 500. idemfence is misconfigured, for example no principal is available while scoping is
 required. The error is logged; the request is not processed. Row 4.

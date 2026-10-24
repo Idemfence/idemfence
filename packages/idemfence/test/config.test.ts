@@ -67,6 +67,7 @@ describe("resolveConfig defaults", () => {
       retention: 86_400_000,
       lease: 30_000,
       keyMaxLength: 255,
+      keySyntax: "sf-string",
       requestBodyCap: 1_048_576,
       responseBodyCap: 1_048_576,
       storeUnavailableRetryAfter: 5_000,
@@ -194,6 +195,15 @@ describe("IdemfenceConfigError codes", () => {
       { keyMaxLength: 256 },
       { keyMaxLength: 64.5 },
       { keyMaxLength: "255" },
+    ]);
+  });
+
+  it("KEY_SYNTAX_INVALID", () => {
+    expectCode("KEY_SYNTAX_INVALID", [
+      { keySyntax: "raw" },
+      { keySyntax: "SF-STRING" },
+      { keySyntax: "" },
+      { keySyntax: true },
     ]);
   });
 
