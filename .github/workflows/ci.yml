@@ -130,11 +130,40 @@ jobs:
           echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> "$GITHUB_ENV"
           echo "IDEMFENCE_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the conformance CLI
+        run: pnpm exec tsc --build packages/conformance/tsconfig.json
+
       - name: Build and start the stack
         run: docker compose -f reference-app/compose.yaml up -d --build --wait
 
       - name: Smoke test
         run: bash reference-app/smoke.sh
+
+      - name: Conformance (must pass)
+        run: node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config reference-app/conformance.json --require-all
+
+      - name: Conformance against the non-conforming routes (must fail)
+        run: |
+          set +e
+          node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config reference-app/conformance.nonconforming.json --json > nonconforming.json
+          status=$?
+          set -e
+          node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config reference-app/conformance.nonconforming.json || true
+          if [ "$status" -eq 0 ]; then echo "::error::the non-conforming run exited 0"; exit 1; fi
+          jq -e '.results[] | select(.row == "6") | select(.outcome == "fail") | select(.messages | join(" ") | test("duplicate side effect"))' nonconforming.json >/dev/null \
+            || { echo "::error::row 6 did not report a duplicate side effect"; exit 1; }
+          echo "non-conforming run exited $status and row 6 reported a duplicate side effect"
 
       - name: Show logs on failure
         if: ${{ failure() }}
