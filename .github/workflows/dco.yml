@@ -1,0 +1,52 @@
+name: DCO
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: dco
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check Signed-off-by trailers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          commits=$(git rev-list --reverse "${BASE_SHA}..${HEAD_SHA}")
+          if [ -z "${commits}" ]; then
+            echo "No commits in ${BASE_SHA}..${HEAD_SHA}."
+            exit 0
+          fi
+
+          failed=0
+          for sha in ${commits}; do
+            author=$(git log -1 --format='%an <%ae>' "${sha}")
+            signoffs=$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly,unfold)' "${sha}" \
+              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if printf '%s\n' "${signoffs}" | grep -Fxq -- "${author}"; then
+              echo "ok      ${sha} ${author}"
+            else
+              echo "missing ${sha} ${author}"
+              echo "::error::Commit ${sha} has no 'Signed-off-by:' trailer matching its author (${author})."
+              failed=1
+            fi
+          done
+
+          if [ "${failed}" -ne 0 ]; then
+            echo
+            echo "Every commit must be signed off by its author. See CONTRIBUTING.md."
+            echo "Fix with 'git rebase --signoff ${BASE_SHA}' and force-push."
+            exit 1
+          fi
