@@ -6,7 +6,7 @@
   "packageManager": "pnpm@12.11.2",
   "scripts": {
     "build": "tsc --build",
-    "typecheck": "tsc --build --noEmit",
+    "typecheck": "tsc --build --noEmit && tsc --project packages/idemfence/test",
     "test": "vitest run",
     "lint": "biome ci",
     "format": "biome format --write"
@@ -14,7 +14,9 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
     "@changesets/cli": "3.0.3",
+    "@types/node": "22.20.5",
     "typescript": "7.0.2",
+    "vite": "8.3.4",
     "vitest": "5.0.3"
   }
 }

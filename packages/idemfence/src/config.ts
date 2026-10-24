@@ -13,6 +13,13 @@
  * - `KEY_MAX_LENGTH_INVALID`: `keyMaxLength` is not an integer from 1 to 255.
  * - `BODY_CAP_INVALID`: `requestBodyCap` or `responseBodyCap` is not a positive integer.
  * - `RELEASE_STATUS_INVALID`: `releaseStatuses` is not an array of integers from 400 to 599.
+ * - `NAMESPACE_INVALID`: `namespace` is not a string of 1 to 64 printable ASCII characters
+ *   (0x21 to 0x7E, so no spaces).
+ * - `HEADER_ALLOWLIST_INVALID`: `headerAllowlist` is not an array of HTTP field names
+ *   (RFC 9110 tokens), or names a header that must not be fingerprinted: `content-type`
+ *   (always included), a header on the contract's response denylist, `authorization`,
+ *   `cookie` or `idempotency-key`.
+ * - `REQUIRED_INVALID`: `required` is not a boolean.
  * - `WEBCRYPTO_MISSING`: `globalThis.crypto.subtle` is not available in this runtime.
  */
 export type IdemfenceConfigErrorCode =
@@ -25,6 +32,9 @@ export type IdemfenceConfigErrorCode =
   | "KEY_MAX_LENGTH_INVALID"
   | "BODY_CAP_INVALID"
   | "RELEASE_STATUS_INVALID"
+  | "NAMESPACE_INVALID"
+  | "HEADER_ALLOWLIST_INVALID"
+  | "REQUIRED_INVALID"
   | "WEBCRYPTO_MISSING";
 
 /** Thrown at construction when idemfence options are invalid. Messages never include secrets. */
@@ -105,6 +115,31 @@ const UNIT_MS = {
   d: 86_400_000,
 } as const;
 const STORE_METHODS = ["begin", "renew", "complete", "release"] as const;
+const NAMESPACE_PATTERN = /^[\x21-\x7e]{1,64}$/;
+// RFC 9110 section 5.1: field-name = token.
+const FIELD_NAME_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+// content-type is always part of the fingerprint. The rest are on the contract's response
+// denylist (section 5) or are volatile or carry secrets.
+const NOT_ALLOWLISTABLE = new Set([
+  "content-type",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "content-length",
+  "date",
+  "server-timing",
+  "traceparent",
+  "tracestate",
+  "set-cookie",
+  "authorization",
+  "cookie",
+  "idempotency-key",
+]);
 
 export function resolveConfig<TRequest>(
   options: IdemfenceOptions<TRequest>,
@@ -205,10 +240,60 @@ export function resolveConfig<TRequest>(
     responseBodyCap: bodyCap("responseBodyCap", options.responseBodyCap),
     storeUnavailableRetryAfter,
     releaseStatuses: Object.freeze([...releaseStatuses]),
-    namespace: options.namespace ?? "idemfence",
-    headerAllowlist: Object.freeze([...(options.headerAllowlist ?? [])]),
-    required: options.required ?? true,
+    namespace: namespace(options.namespace),
+    headerAllowlist: headerAllowlist(options.headerAllowlist),
+    required: requiredFlag(options.required),
   });
+}
+
+function namespace(value: unknown): string {
+  const resolved = value ?? "idemfence";
+  if (typeof resolved !== "string" || !NAMESPACE_PATTERN.test(resolved)) {
+    throw new IdemfenceConfigError(
+      "NAMESPACE_INVALID",
+      "Option `namespace` must be 1 to 64 printable ASCII characters (0x21 to 0x7E).",
+    );
+  }
+  return resolved;
+}
+
+function headerAllowlist(value: unknown): readonly string[] {
+  const names = value ?? [];
+  if (!Array.isArray(names)) {
+    throw new IdemfenceConfigError(
+      "HEADER_ALLOWLIST_INVALID",
+      "Option `headerAllowlist` must be an array of HTTP field names.",
+    );
+  }
+  const resolved = new Set<string>();
+  for (const name of names) {
+    if (typeof name !== "string" || !FIELD_NAME_PATTERN.test(name)) {
+      throw new IdemfenceConfigError(
+        "HEADER_ALLOWLIST_INVALID",
+        "Option `headerAllowlist` must contain only HTTP field names (RFC 9110 tokens).",
+      );
+    }
+    const lower = name.toLowerCase();
+    if (NOT_ALLOWLISTABLE.has(lower)) {
+      throw new IdemfenceConfigError(
+        "HEADER_ALLOWLIST_INVALID",
+        `Option \`headerAllowlist\` must not include "${lower}": content-type is always fingerprinted, and denylisted, volatile or secret-bearing headers cannot be.`,
+      );
+    }
+    resolved.add(lower);
+  }
+  return Object.freeze([...resolved]);
+}
+
+function requiredFlag(value: unknown): boolean {
+  const resolved = value ?? true;
+  if (typeof resolved !== "boolean") {
+    throw new IdemfenceConfigError(
+      "REQUIRED_INVALID",
+      "Option `required` must be a boolean.",
+    );
+  }
+  return resolved;
 }
 
 function secretBytes(option: string, value: unknown): Uint8Array {

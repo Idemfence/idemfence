@@ -99,6 +99,17 @@ describe("resolveConfig defaults", () => {
     ).toBe(3_600_000);
   });
 
+  it("lowercases and de-duplicates the header allowlist", () => {
+    const config = resolveConfig({
+      ...required(),
+      headerAllowlist: ["X-Tenant-ID", "accept-language", "x-tenant-id"],
+    });
+    expect(config.headerAllowlist).toStrictEqual([
+      "x-tenant-id",
+      "accept-language",
+    ]);
+  });
+
   it("copies byte secrets so later caller mutation has no effect", () => {
     const bytes = new Uint8Array(32).fill(7);
     const config = resolveConfig({
@@ -206,6 +217,43 @@ describe("IdemfenceConfigError codes", () => {
       { releaseStatuses: [429.5] },
       { releaseStatuses: ["429"] },
       { releaseStatuses: 429 },
+    ]);
+  });
+
+  it("NAMESPACE_INVALID", () => {
+    expectCode("NAMESPACE_INVALID", [
+      { namespace: "" },
+      { namespace: "has space" },
+      { namespace: "tab\there" },
+      { namespace: "café" },
+      { namespace: "x".repeat(65) },
+      { namespace: 42 },
+    ]);
+  });
+
+  it("HEADER_ALLOWLIST_INVALID", () => {
+    expectCode("HEADER_ALLOWLIST_INVALID", [
+      { headerAllowlist: "accept-language" },
+      { headerAllowlist: [""] },
+      { headerAllowlist: ["x header"] },
+      { headerAllowlist: ["x-header:"] },
+      { headerAllowlist: ["x-tenant", 7] },
+      { headerAllowlist: ["Content-Type"] },
+      { headerAllowlist: ["Authorization"] },
+      { headerAllowlist: ["cookie"] },
+      { headerAllowlist: ["Idempotency-Key"] },
+      { headerAllowlist: ["transfer-encoding"] },
+      { headerAllowlist: ["traceparent"] },
+      { headerAllowlist: ["Set-Cookie"] },
+      { headerAllowlist: ["date"] },
+    ]);
+  });
+
+  it("REQUIRED_INVALID", () => {
+    expectCode("REQUIRED_INVALID", [
+      { required: "true" },
+      { required: 1 },
+      { required: {} },
     ]);
   });
 });
