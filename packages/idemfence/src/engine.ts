@@ -37,6 +37,8 @@ export type Handler = (
 ) => Promise<Response>;
 
 export interface Engine {
+  /** Verifies the store once (memoised on success); rejects with the store's error. */
+  ready(): Promise<void>;
   /**
    * Applies the contract to one request on a configured route. The route object is
    * validated on first use and cached by identity.
@@ -68,6 +70,15 @@ const HEADER_DENYLIST = new Set([
   "traceparent",
   "tracestate",
 ]);
+
+// Responses the engine generated for row 15, so an adapter can close the connection without
+// inspecting headers; a handler's own 413 is never in this set.
+const bodyTooLargeResponses = new WeakSet<Response>();
+
+/** True only for a 413 the engine itself produced for contract row 15. */
+export function isBodyTooLargeResponse(response: Response): boolean {
+  return bodyTooLargeResponses.has(response);
+}
 
 const passthroughContext: HandlerContext = {
   async renew() {},
@@ -152,7 +163,9 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     // Row 15.
     const printed = await fingerprint(request, route);
     if ("error" in printed) {
-      return problem(route, "body-too-large");
+      const response = problem(route, "body-too-large");
+      bodyTooLargeResponses.add(response);
+      return response;
     }
 
     const key = await lookupKey({
@@ -427,7 +440,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     }
   }
 
-  return { handle };
+  return { ready: ensureReady, handle };
 }
 
 /** Row 6: the stored response with the replay headers and a recomputed Content-Length. */

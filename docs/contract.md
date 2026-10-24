@@ -156,6 +156,8 @@ Further requirements:
 - Row 14: fail-open (running the handler without idemfence when the store is unavailable)
   MAY be enabled only as an explicit per-route opt-in. Every fail-open request MUST be
   logged at warn level.
+- Row 15: the 413 response MUST carry `Connection: close`, and the middleware MUST NOT read
+  the rest of the request body; an unbounded upload is never drained.
 - Row 16: a client disconnect MUST NOT fire the handler's abort signal.
 
 ## 5. Responses
