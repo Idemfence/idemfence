@@ -93,8 +93,11 @@ key can never equal a fingerprint.
             || enc(body) )
    ```
 
-2. `concrete path` is the request path exactly as received, without the query and without
-   decoding or normalisation.
+2. `concrete path` is the pathname of the request URL as parsed by the WHATWG URL Standard
+   (`new URL(url).pathname`), without the query. Every adapter MUST derive it this way, so
+   identical requests fingerprint identically across adapters. The WHATWG parser resolves
+   dot segments and percent-encodes some characters; its result is used as is, with no
+   further decoding.
 3. `canonical query` is the query parsed with the WHATWG `application/x-www-form-urlencoded`
    parser, stably sorted by name (as `URLSearchParams.prototype.sort()` does, which keeps
    the relative order of repeated names), then serialised with the same format. An absent
@@ -276,6 +279,45 @@ handler's transaction rolls back and frees the key.
 Any change to observable behaviour defined in this document is a semver-major change. This
 includes status codes, headers, problem types, the evaluation order, and the lookup key and
 fingerprint encodings. Editorial changes that do not alter behaviour are not.
+
+## Appendix A. Test vectors
+
+Implementations MUST reproduce these digests byte for byte. Digests are lowercase hex
+SHA-256. Unless a vector says otherwise, the namespace is `idemfence`, the fingerprint
+allowlist is empty, and no headers other than those listed are present.
+
+### Lookup keys
+
+| #  | principal | method | route template | client key | lookup key |
+| -- | --------- | ------ | -------------- | ---------- | ---------- |
+| L1 | `user-1` | `POST` | `/orders` | `8e03978e-40d5-43e8-bc93-6894a57f9324` | `20a9b317bd9314b4fe75ed1ca5b16184ee9ef404bd0ba1e92530fcfd6f3a9b61` |
+| L2 | `ab` | `POST` | `c` | `k` | `9cf6d67825a4d64a64c4d609427cfed8482e4adb8be186740cbda0d6e3122848` |
+| L3 | `a` | `POST` | `bc` | `k` | `cc56d56d0a9c41025aea2e0a6797ae9f6deeb96284a33725c53b5040a95dae9c` |
+
+L2 and L3 concatenate to the same principal and route template text (`abc`); the length
+prefixes keep them apart.
+
+### Fingerprints
+
+| #   | request | Content-Type | body | fingerprint |
+| --- | ------- | ------------ | ---- | ----------- |
+| F1  | `POST https://api.example.com/orders` | absent | empty | `7045f9603f3fb5cf7d8ce97d45b3c3e7ca1e3e8cb9623e156f86d94813e932dc` |
+| F2  | `POST https://api.example.com/orders` | `application/json` | `{"amount":100}` | `05ded99e6efe8a94840e845b018f6ebe152ad66a8d145e7fd5eaad295107bd82` |
+| F3  | `POST https://api.example.com/orders?b=2&a=1&a=0` | `application/json` | `{"amount":100}` | `70e9344b7b6d5933a76b74814e0bce5ff5def8644208cf90478d925fe43aa078` |
+| F3' | `POST https://api.example.com/orders?a=1&b=2&a=0` | `application/json` | `{"amount":100}` | `70e9344b7b6d5933a76b74814e0bce5ff5def8644208cf90478d925fe43aa078` |
+| F4a | `POST https://api.example.com/orders` | absent | `x` | `41e855383497f6c43817e7a16cafe2df3ff6f8d3022993053c11beacf8bbf0f0` |
+| F4b | `POST https://api.example.com/orders` | present, empty | `x` | `2b9ce6afb919ab31dcba4268cff7737e50d752d2f92ef23f92d720f306213516` |
+| F5  | `POST https://api.example.com/orders` with `X-Tenant-ID: t-42`; allowlist `x-tenant-id`, `accept-language` | `application/json` | `{"amount":100}` | `709bce267e32c52c842bf96abd3c6e4f01aa3a789c9ce2fef3f852f0028b4ceb` |
+| F6  | `PUT https://api.example.com/orders/../orders/%7e42` | `application/json` | `{"amount":100}` | `8cb4f171b055b24098db98c22e5e797c5f61700f630f847353624bbc9ee0b8e4` |
+
+Notes:
+
+- F3 and F3' differ only in query order and share one digest: both canonical queries are
+  `a=1&a=0&b=2` (repeated names keep their relative order).
+- F4a and F4b differ only in an absent versus an empty `Content-Type`.
+- In F5, `accept-language` is allowlisted but absent, and is encoded as absent.
+- In F6, the WHATWG pathname is `/orders/%7e42`.
+- Bodies are the exact bytes shown, without a trailing newline.
 
 ## References
 
