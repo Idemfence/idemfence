@@ -3,7 +3,6 @@
 import { execFileSync } from "node:child_process";
 
 const ALLOWED = new Set([
-  "MIT",
   "Apache-2.0",
   "BSD-2-Clause",
   "BSD-3-Clause",
