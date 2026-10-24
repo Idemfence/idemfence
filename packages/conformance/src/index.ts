@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -16,6 +16,12 @@ export interface Fixture {
 }
 
 export interface TargetConfig {
+  /**
+   * Must be `true`: every scenario creates real side effects in the target (records in its
+   * idempotency store and whatever its handlers do, such as creating orders). Never point the
+   * suite at production.
+   */
+  acknowledgeSideEffects: true;
   /** Headers sent on every request, for example a principal or an auth header. */
   headers: Record<string, string>;
   keyMaxLength: number;
@@ -50,12 +56,27 @@ export class ConfigError extends Error {
 
 const METHOD = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
+export const SIDE_EFFECTS_MESSAGE =
+  'acknowledgeSideEffects must be true: every scenario creates real side effects in the target (records in its idempotency store and whatever its handlers do, such as creating orders). Point this suite only at a disposable environment, never at production, and set "acknowledgeSideEffects": true in the config to confirm.';
+
+/** Every key the suite sends starts with this, so its records are identifiable in logs. */
+export const KEY_PREFIX = "idemfence-conformance-";
+
+/** A fresh key that can never collide with a real client's: the prefix plus a random UUID. */
+export function newKey(): string {
+  return `${KEY_PREFIX}${randomUUID()}`;
+}
+
 /** Validates a parsed JSON config; throws {@link ConfigError} listing every problem. */
 export function validateConfig(value: unknown): TargetConfig {
   const problems: string[] = [];
   const object = isRecord(value) ? value : {};
   if (!isRecord(value)) {
     problems.push("config must be a JSON object");
+  }
+
+  if (object.acknowledgeSideEffects !== true) {
+    problems.push(SIDE_EFFECTS_MESSAGE);
   }
 
   const headers: Record<string, string> = {};
@@ -216,6 +237,7 @@ export function validateConfig(value: unknown): TargetConfig {
     throw new ConfigError(problems);
   }
   return {
+    acknowledgeSideEffects: true,
     headers,
     keyMaxLength: keyMaxLength as number,
     requestBodyCap: requestBodyCap as number,
@@ -469,9 +491,6 @@ interface Context {
   first?: { key: string; reply: Reply; countAfter: number };
 }
 
-const newKey = (row: string): string =>
-  `conformance-${row}-${randomBytes(6).toString("hex")}`;
-
 function problem(
   check: Check,
   reply: Reply,
@@ -545,7 +564,7 @@ const scenarios: {
     title: "an unconfigured route or method ignores the key",
     scenario: async (ctx, check) => {
       const fixture = ctx.fixture("passthrough");
-      const key = newKey("1");
+      const key = newKey();
       const first = await ctx.client.send(fixture, { key });
       const second = await ctx.client.send(fixture, { key });
       check.that(
@@ -594,7 +613,7 @@ const scenarios: {
       if (ctx.config.keySyntax === "sf-string") {
         cases.push([
           "unquoted token",
-          { rawKey: `abc-${randomBytes(4).toString("hex")}` },
+          { rawKey: `${KEY_PREFIX}${randomBytes(4).toString("hex")}` },
         ]);
       }
       const before = await ctx.count();
@@ -619,7 +638,7 @@ const scenarios: {
       const { omitHeaders } = ctx.fixture("noPrincipal");
       const before = await ctx.count();
       const reply = await ctx.client.send(ctx.fixture("create"), {
-        key: newKey("4"),
+        key: newKey(),
         omitHeaders,
       });
       problem(check, reply, 500, "configuration-error");
@@ -634,7 +653,7 @@ const scenarios: {
     title: "the first request runs the handler once",
     scenario: async (ctx, check) => {
       const before = await ctx.count();
-      const key = newKey("5");
+      const key = newKey();
       const reply = await ctx.client.send(ctx.fixture("create"), { key });
       check.that(
         reply.status >= 200 && reply.status < 300,
@@ -686,7 +705,7 @@ const scenarios: {
     title: "the same key with a different body is a 422 key-reused",
     scenario: async (ctx, check) => {
       const fixture = ctx.fixture("create");
-      const key = newKey("7");
+      const key = newKey();
       const first = await ctx.client.send(fixture, { key });
       check.that(
         first.status >= 200 && first.status < 300,
@@ -710,7 +729,7 @@ const scenarios: {
       "a request while the first is in flight is a 409 with an integer Retry-After",
     scenario: async (ctx, check) => {
       const fixture = ctx.fixture("slow");
-      const key = newKey("8");
+      const key = newKey();
       const before = await ctx.count();
       const inFlight = ctx.client.send(fixture, { key });
       await sleep(Math.min(500, Math.floor(fixture.workMs / 3)));
@@ -745,7 +764,7 @@ const scenarios: {
     title: "a key past retention is treated as a first request",
     scenario: async (ctx, check) => {
       const fixture = ctx.fixture("shortRetention");
-      const key = newKey("10");
+      const key = newKey();
       const before = await ctx.count();
       const first = await ctx.client.send(fixture, { key });
       check.that(
@@ -774,7 +793,7 @@ const scenarios: {
     title: "a release status is returned as-is and the key stays reusable",
     scenario: async (ctx, check) => {
       const fixture = ctx.fixture("release");
-      const key = newKey("11");
+      const key = newKey();
       const first = await ctx.client.send(fixture, { key });
       check.that(
         first.status === fixture.status,
@@ -800,7 +819,7 @@ const scenarios: {
     title: "a thrown error is a stored 500 about:blank problem that replays",
     scenario: async (ctx, check) => {
       const fixture = ctx.fixture("throws");
-      const key = newKey("12");
+      const key = newKey();
       const before = await ctx.count();
       const first = await ctx.client.send(fixture, { key });
       problem(check, first, 500, "about:blank");
@@ -847,7 +866,7 @@ const scenarios: {
       const body = Buffer.from(
         `{"item":"${"x".repeat(Math.max(1, padding))}"}`,
       );
-      const reply = await ctx.client.send(fixture, { key: newKey("15"), body });
+      const reply = await ctx.client.send(fixture, { key: newKey(), body });
       problem(check, reply, 413, "body-too-large");
       const connection = reply.headers.connection;
       if (connection === undefined) {
@@ -871,7 +890,7 @@ const scenarios: {
     title: "a client disconnect does not abort the handler; a retry replays",
     scenario: async (ctx, check) => {
       const fixture = ctx.fixture("slow");
-      const key = newKey("16");
+      const key = newKey();
       const before = await ctx.count();
       await ctx.client.send(fixture, {
         key,
@@ -904,6 +923,9 @@ export async function runContractGroup(
   config: TargetConfig,
   options: { only?: number[] | undefined } = {},
 ): Promise<RowResult[]> {
+  if (config.acknowledgeSideEffects !== true) {
+    throw new ConfigError([SIDE_EFFECTS_MESSAGE]);
+  }
   const base = new URL(baseUrl);
   const client = new Client(base, config.headers);
   const only =

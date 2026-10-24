@@ -1,5 +1,8 @@
 {
-  "headers": { "X-Principal": "conformance" },
+  "acknowledgeSideEffects": true,
+  "headers": {
+    "X-Principal": "conformance"
+  },
   "keyMaxLength": 255,
   "requestBodyCap": 1048576,
   "keySyntax": "sf-string",
@@ -7,38 +10,57 @@
     "create": {
       "method": "POST",
       "path": "/orders",
-      "body": { "item": "widget" },
-      "alternateBody": { "item": "gadget" }
+      "body": {
+        "item": "widget"
+      },
+      "alternateBody": {
+        "item": "gadget"
+      }
     },
-    "count": { "path": "/orders/count" },
+    "count": {
+      "path": "/orders/count"
+    },
     "slow": {
       "method": "POST",
       "path": "/orders",
-      "body": { "item": "slow", "simulateWorkMs": 1500 },
+      "body": {
+        "item": "slow",
+        "simulateWorkMs": 1500
+      },
       "workMs": 1500
     },
     "release": {
       "method": "POST",
       "path": "/fixtures/release",
-      "body": { "item": "widget" },
+      "body": {
+        "item": "widget"
+      },
       "status": 429
     },
     "throws": {
       "method": "POST",
       "path": "/fixtures/throws",
-      "body": { "item": "widget" }
+      "body": {
+        "item": "widget"
+      }
     },
     "shortRetention": {
       "method": "POST",
       "path": "/fixtures/short-retention",
-      "body": { "item": "widget" },
+      "body": {
+        "item": "widget"
+      },
       "retentionMs": 1500
     },
     "passthrough": {
       "method": "POST",
       "path": "/fixtures/passthrough",
-      "body": { "item": "widget" }
+      "body": {
+        "item": "widget"
+      }
     },
-    "noPrincipal": { "omitHeaders": ["X-Principal"] }
+    "noPrincipal": {
+      "omitHeaders": ["X-Principal"]
+    }
   }
 }

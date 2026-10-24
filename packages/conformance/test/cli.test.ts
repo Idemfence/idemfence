@@ -1,9 +1,18 @@
+import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   ConfigError,
   formatHuman,
+  KEY_PREFIX,
+  newKey,
   parseCliArgs,
   type RowResult,
+  SIDE_EFFECTS_MESSAGE,
   summarize,
   validateConfig,
 } from "../src/index.js";
@@ -66,11 +75,16 @@ describe("parseCliArgs", () => {
   });
 });
 
-const minimal = { keyMaxLength: 255, requestBodyCap: 1024 };
+const minimal = {
+  acknowledgeSideEffects: true,
+  keyMaxLength: 255,
+  requestBodyCap: 1024,
+};
 
 describe("validateConfig", () => {
   it("accepts a minimal config and applies defaults", () => {
     expect(validateConfig(minimal)).toStrictEqual({
+      acknowledgeSideEffects: true,
       headers: {},
       keyMaxLength: 255,
       requestBodyCap: 1024,
@@ -121,7 +135,22 @@ describe("validateConfig", () => {
 
   it.each([
     [null, "config must be a JSON object"],
-    [{ requestBodyCap: 1 }, "keyMaxLength must be"],
+    [
+      { keyMaxLength: 255, requestBodyCap: 1 },
+      "acknowledgeSideEffects must be true",
+    ],
+    [
+      { acknowledgeSideEffects: false, keyMaxLength: 255, requestBodyCap: 1 },
+      "acknowledgeSideEffects must be true",
+    ],
+    [
+      { acknowledgeSideEffects: "true", keyMaxLength: 255, requestBodyCap: 1 },
+      "acknowledgeSideEffects must be true",
+    ],
+    [
+      { acknowledgeSideEffects: true, requestBodyCap: 1 },
+      "keyMaxLength must be",
+    ],
     [{ keyMaxLength: 256, requestBodyCap: 1 }, "keyMaxLength must be"],
     [{ keyMaxLength: 255 }, "requestBodyCap must be"],
     [{ ...minimal, keySyntax: "raw" }, "keySyntax must be"],
@@ -246,5 +275,57 @@ describe("summarize and formatHuman", () => {
     expect(text).toMatch(
       /summary: 1 passed, 0 failed, 1 not run, 1 not testable, 1 skipped: OK$/,
     );
+  });
+});
+
+describe("keys", () => {
+  it("are fresh UUIDs with the idemfence-conformance- prefix", () => {
+    const keys = new Set(Array.from({ length: 50 }, () => newKey()));
+    expect(keys.size).toBe(50);
+    for (const key of keys) {
+      expect(key.startsWith(KEY_PREFIX)).toBe(true);
+      expect(key).toMatch(
+        /^idemfence-conformance-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(key.length).toBeLessThanOrEqual(255);
+    }
+  });
+});
+
+describe("the built CLI", () => {
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), "idemfence-conformance-"));
+  const run = async (config: unknown) => {
+    const file = join(dir, "target.json");
+    writeFileSync(file, JSON.stringify(config));
+    try {
+      await promisify(execFile)(process.execPath, [
+        cli,
+        "--url",
+        "http://127.0.0.1:1",
+        "--config",
+        file,
+      ]);
+      return { code: 0, stderr: "" };
+    } catch (error) {
+      const failure = error as { code?: number; stderr?: string };
+      return { code: failure.code ?? -1, stderr: failure.stderr ?? "" };
+    }
+  };
+
+  it("refuses to run without the side-effects acknowledgement (exit 2)", async () => {
+    try {
+      for (const config of [
+        { keyMaxLength: 255, requestBodyCap: 1 },
+        { acknowledgeSideEffects: false, keyMaxLength: 255, requestBodyCap: 1 },
+      ]) {
+        const { code, stderr } = await run(config);
+        expect(code).toBe(2);
+        expect(stderr).toContain(SIDE_EFFECTS_MESSAGE);
+        expect(stderr).not.toContain("running the Contract group");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

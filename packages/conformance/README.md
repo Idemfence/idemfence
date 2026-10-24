@@ -21,10 +21,26 @@ Exit status is 0 only when no scenario failed and, with `--require-all`, none wa
 Rows 9, 13 and 14 are not testable black-box and are reported as such; they never fail and
 are not counted by `--require-all`.
 
+## Side effects
+
+Every scenario creates real side effects in the target: records in its idempotency store
+and whatever its handlers do (the reference app creates orders). The CLI refuses to run
+unless the config contains `"acknowledgeSideEffects": true`, and prints a one-line banner
+with the target URL before starting. **Never point it at production.**
+
+Every key the suite sends is `idemfence-conformance-<random UUID>`, so its requests are
+identifiable in the target's logs and can never collide with a real client's key. The
+records themselves cannot be found by key in the store: idemfence stores only hashed lookup
+keys. They expire after the target's retention and are removed by its purge. The handlers'
+side effects (such as orders) are the target's own data. Run the suite against a disposable
+environment, for example the reference app's compose stack, and discard it afterwards with
+`docker compose down -v`.
+
 ## Target configuration
 
 ```json
 {
+  "acknowledgeSideEffects": true,
   "headers": { "X-Principal": "conformance" },
   "keyMaxLength": 255,
   "requestBodyCap": 1048576,
@@ -44,6 +60,7 @@ are not counted by `--require-all`.
 
 | Field | Required | Meaning |
 | ----- | -------- | ------- |
+| `acknowledgeSideEffects` | yes | Must be `true`; see "Side effects" above. |
 | `headers` | no | Headers sent on every request: a principal, an auth token, and so on. Default `{}`. |
 | `keyMaxLength` | yes | The target's maximum key length (1–255), for the over-length case of row 3. |
 | `requestBodyCap` | yes | The target's request body cap in bytes, for row 15. |
@@ -64,5 +81,5 @@ Every fixture except `count` and `noPrincipal` has `method`, `path` and an optio
 | `passthrough` | 1 | none; a route or method the target does not make idempotent. |
 | `noPrincipal` | 4 | `omitHeaders`: headers to leave out so the target sees no principal. |
 
-The suite generates its own keys (`conformance-<row>-<random>`), sent as Structured Field
+The suite generates its own keys (`idemfence-conformance-<UUID>`), sent as Structured Field
 Strings, and never reuses one across rows.

@@ -38,6 +38,9 @@ async function main(): Promise<number> {
     return 2;
   }
 
+  console.error(
+    `idemfence-conformance: running the Contract group against ${options.url}; every scenario creates real side effects in the target.`,
+  );
   const results = await runContractGroup(options.url, config, {
     only: options.only,
   });
