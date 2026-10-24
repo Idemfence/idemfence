@@ -14,9 +14,26 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./postgres": {
+      "types": "./dist/stores/postgres/index.d.ts",
+      "default": "./dist/stores/postgres/index.js"
     }
   },
   "files": [
-    "dist"
-  ]
+    "dist",
+    "migrations"
+  ],
+  "peerDependencies": {
+    "pg": "^8.23.1"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "pg": "8.23.1"
+  }
 }

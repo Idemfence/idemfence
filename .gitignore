@@ -4,3 +4,4 @@ coverage/
 .env*
 .claude/settings.local.json
 *.tsbuildinfo
+.idea/

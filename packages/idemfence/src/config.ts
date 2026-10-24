@@ -1,3 +1,5 @@
+import type { Store } from "./store.js";
+
 /**
  * Stable codes for {@link IdemfenceConfigError}:
  *
@@ -48,14 +50,6 @@ export class IdemfenceConfigError extends Error {
     this.name = "IdemfenceConfigError";
     this.code = code;
   }
-}
-
-/** The store operations idemfence calls. Only their presence is checked at construction. */
-export interface Store {
-  begin(...args: never[]): unknown;
-  renew(...args: never[]): unknown;
-  complete(...args: never[]): unknown;
-  release(...args: never[]): unknown;
 }
 
 export type KeySyntax = "sf-string" | "sf-string-or-raw";
