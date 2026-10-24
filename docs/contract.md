@@ -200,9 +200,12 @@ Every `Retry-After` that idemfence emits is delay-seconds (Section 10.2.3 of
 applies to the remaining lease (row 8, lease mode), the lock timeout (row 8, transactional
 mode), and the configured store-unavailable delay (row 14, default 5 seconds).
 
-A problem `type` URI is the configured documentation URL followed by `#` and the anchor
-below. The documentation URL MUST use HTTPS. It defaults to this document at the release
-tag of the installed version. A 500 for a handler throw (rows 12 and 13) uses the type
+A problem `type` URI is the documentation URL followed by `#` and the anchor below. The
+documentation URL is the required `docsUrl` option and MUST use HTTPS. It points to the
+operator's own published idempotency documentation, which Section 2.5.2 of the draft
+requires every resource to publish. There is no default. idemfence ships
+`docs/api-contract-template.md` (step 4.5), a template for that documentation containing
+the anchors this section defines. A 500 for a handler throw (rows 12 and 13) uses the type
 `about:blank`.
 
 ### key-missing
