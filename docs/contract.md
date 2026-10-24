@@ -189,11 +189,18 @@ Further requirements:
    - `Set-Cookie`, unless the route explicitly allows it.
 4. **Body cap.** Each route has a response body cap (default 1 MiB). If the body exceeds
    it, the original response is still sent in full and the record is still completed, with
-   the status and stored headers but without the body. A metric and an error log entry MUST
-   be emitted when the record is written. A replay of such a record returns the original
-   status and stored headers (including `Location` and `ETag`), an empty body, and
+   the status and stored headers but without the body. The middleware MUST NOT buffer more
+   than the cap: once it is exceeded, the record is completed without the body (still before
+   any byte is sent), and the client receives the buffered prefix followed by the rest of the
+   handler's body as it streams. A metric and an error log entry MUST be emitted when the
+   record is written. A replay of such a record returns the original status and stored
+   headers (including `Location` and `ETag`), an empty body, and
    `Idempotent-Body-Omitted: true`.
-5. Every replay carries `Idempotent-Replayed: true`.
+5. **Unsupported streaming.** A handler response with a `text/event-stream` content type is
+   replaced by a 500 problem (`about:blank`), which is stored and sent, and an error is
+   logged.
+6. Every replay carries `Idempotent-Replayed: true`, and its `Content-Length` is recomputed
+   from the stored body.
 
 ## 6. Errors
 
@@ -216,7 +223,8 @@ operator's own published idempotency documentation, which Section 2.5.2 of the d
 requires every resource to publish. There is no default. idemfence ships
 `docs/api-contract-template.md` (step 4.5), a template for that documentation containing
 the anchors this section defines. A 500 for a handler throw (rows 12 and 13) uses the type
-`about:blank`.
+`about:blank`. `Link` is sent for every problem type defined in this section; it is omitted
+for `about:blank`, which links to nothing.
 
 ### key-missing
 
@@ -281,7 +289,15 @@ configured lock timeout, then receives 409 [in-flight](#in-flight) with `Retry-A
 that timeout in whole seconds, rounded up (minimum 1). Row 9 does not apply: a crashed
 handler's transaction rolls back and frees the key.
 
-## 8. Versioning
+## 8. Logging
+
+Log entries emitted by idemfence carry only these fields: `keyHash` (the first 8 hex
+characters of the lookup key, absent before the key is computed), `row` (the contract row),
+`outcome` (a fixed label), `attempt` (a number), and for failures `error` (the error's name
+and, when present, code). Entries MUST NOT contain raw client keys, request or response
+bodies, header values, or error messages that may embed them.
+
+## 9. Versioning
 
 Any change to observable behaviour defined in this document is a semver-major change. This
 includes status codes, headers, problem types, the evaluation order, and the lookup key and

@@ -110,6 +110,28 @@ export function problemResponse(
   });
 }
 
+/**
+ * The 500 for a handler failure (contract rows 12 and 13): type `about:blank`, so the title is
+ * the status phrase and no Link header is sent. The detail is generic and never includes the
+ * handler's error.
+ */
+export function internalProblemResponse(
+  detail = "The request could not be processed because of an internal error.",
+): Response {
+  return new Response(
+    JSON.stringify({
+      type: "about:blank",
+      title: "Internal Server Error",
+      status: 500,
+      detail,
+    }),
+    {
+      status: 500,
+      headers: { "content-type": "application/problem+json" },
+    },
+  );
+}
+
 /** Retry-After delay-seconds: whole seconds, rounded up, minimum 1 (docs/contract.md section 6). */
 export function retryAfterSeconds(ms: number): number {
   if (!Number.isFinite(ms)) {
