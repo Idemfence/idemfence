@@ -87,6 +87,10 @@ describe("resolveConfig defaults", () => {
       namespace: "idemfence",
       headerAllowlist: [],
       required: true,
+      logger: expect.objectContaining({
+        warn: expect.any(Function),
+        error: expect.any(Function),
+      }),
     });
     expect(Object.isFrozen(config)).toBe(true);
     expect(Object.isFrozen(config.previousSecrets)).toBe(true);
@@ -268,6 +272,15 @@ describe("IdemfenceConfigError codes", () => {
       { headerAllowlist: ["traceparent"] },
       { headerAllowlist: ["Set-Cookie"] },
       { headerAllowlist: ["date"] },
+    ]);
+  });
+
+  it("LOGGER_INVALID", () => {
+    expectCode("LOGGER_INVALID", [
+      { logger: console.log },
+      { logger: { warn() {} } },
+      { logger: { warn: "yes", error() {} } },
+      { logger: "console" },
     ]);
   });
 

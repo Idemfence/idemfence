@@ -23,6 +23,10 @@ import type { Store } from "./store.js";
  *   (always included), a header on the contract's response denylist, `authorization`,
  *   `cookie` or `idempotency-key`.
  * - `REQUIRED_INVALID`: `required` is not a boolean.
+ * - `LOGGER_INVALID`: `logger` is not an object with `warn` and `error` functions.
+ * - `ROUTE_TEMPLATE_INVALID`: a route's `routeTemplate` is not a string of 1 to 2048
+ *   printable ASCII characters starting with `/`.
+ * - `ROUTE_FLAG_INVALID`: a route's `allowSetCookieReplay` or `failOpen` is not a boolean.
  * - `WEBCRYPTO_MISSING`: `globalThis.crypto.subtle` is not available in this runtime.
  */
 export type IdemfenceConfigErrorCode =
@@ -39,6 +43,9 @@ export type IdemfenceConfigErrorCode =
   | "NAMESPACE_INVALID"
   | "HEADER_ALLOWLIST_INVALID"
   | "REQUIRED_INVALID"
+  | "LOGGER_INVALID"
+  | "ROUTE_TEMPLATE_INVALID"
+  | "ROUTE_FLAG_INVALID"
   | "WEBCRYPTO_MISSING";
 
 /** Thrown at construction when idemfence options are invalid. Messages never include secrets. */
@@ -56,6 +63,26 @@ export type KeySyntax = "sf-string" | "sf-string-or-raw";
 
 /** Positive integer milliseconds, or a string such as `"30s"` (units: ms, s, m, h, d). */
 export type Duration = number | `${number}${"ms" | "s" | "m" | "h" | "d"}`;
+
+/**
+ * Fields attached to every log entry (docs/contract.md section 8). They never carry raw
+ * client keys, bodies or header values.
+ */
+export interface LogFields {
+  /** First 8 hex characters of the lookup key; absent before the key is computed. */
+  readonly keyHash?: string;
+  /** The contract row the entry relates to. */
+  readonly row?: number;
+  readonly outcome: string;
+  readonly attempt?: number;
+  /** The failing error's name and (when it has one) code; never its message. */
+  readonly error?: { readonly name: string; readonly code?: string };
+}
+
+export interface Logger {
+  warn(message: string, fields: LogFields): void;
+  error(message: string, fields: LogFields): void;
+}
 
 export interface IdemfenceOptions<TRequest = unknown> {
   store: Store;
@@ -80,6 +107,8 @@ export interface IdemfenceOptions<TRequest = unknown> {
   namespace?: string;
   headerAllowlist?: readonly string[];
   required?: boolean;
+  /** Receives warn and error entries; defaults to `console`. */
+  logger?: Logger;
 }
 
 /** Fully-defaulted, frozen configuration. Durations are in milliseconds, caps in bytes. */
@@ -100,6 +129,39 @@ export interface ResolvedConfig<TRequest = unknown> {
   readonly namespace: string;
   readonly headerAllowlist: readonly string[];
   readonly required: boolean;
+  readonly logger: Logger;
+}
+
+/** Per-route configuration: the template plus optional overrides of the global options. */
+export interface RouteConfig {
+  /** The configured template, for example `/orders/:id`; part of the lookup key. */
+  routeTemplate: string;
+  required?: boolean;
+  keySyntax?: KeySyntax;
+  keyMaxLength?: number;
+  requestBodyCap?: number;
+  responseBodyCap?: number;
+  releaseStatuses?: readonly number[];
+  headerAllowlist?: readonly string[];
+  storeUnavailableRetryAfter?: Duration;
+  /** Replay `Set-Cookie` headers for this route (contract section 5); default false. */
+  allowSetCookieReplay?: boolean;
+  /** Run the handler without idempotency when the store is unavailable (row 14); default false. */
+  failOpen?: boolean;
+}
+
+export interface ResolvedRoute {
+  readonly routeTemplate: string;
+  readonly required: boolean;
+  readonly keySyntax: KeySyntax;
+  readonly keyMaxLength: number;
+  readonly requestBodyCap: number;
+  readonly responseBodyCap: number;
+  readonly releaseStatuses: readonly number[];
+  readonly headerAllowlist: readonly string[];
+  readonly storeUnavailableRetryAfter: number;
+  readonly allowSetCookieReplay: boolean;
+  readonly failOpen: boolean;
 }
 
 // The package compiles against the ES2022 library only, so the runtime globals it needs
@@ -108,6 +170,7 @@ const runtime = globalThis as unknown as {
   crypto?: { subtle?: unknown };
   TextEncoder: new () => { encode(input: string): Uint8Array };
   URL: new (input: string) => { protocol: string; href: string };
+  console: { warn(...args: unknown[]): void; error(...args: unknown[]): void };
 };
 
 const MIN_SECRET_BYTES = 32;
@@ -121,6 +184,7 @@ const UNIT_MS = {
 } as const;
 const STORE_METHODS = ["begin", "renew", "complete", "release"] as const;
 const NAMESPACE_PATTERN = /^[\x21-\x7e]{1,64}$/;
+const ROUTE_TEMPLATE_PATTERN = /^\/[\x21-\x7e]{0,2047}$/;
 // RFC 9110 section 5.1: field-name = token.
 const FIELD_NAME_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 // content-type is always part of the fingerprint. The rest are on the contract's response
@@ -145,6 +209,15 @@ const NOT_ALLOWLISTABLE = new Set([
   "cookie",
   "idempotency-key",
 ]);
+
+const defaultLogger: Logger = {
+  warn(message, fields) {
+    runtime.console.warn(message, fields);
+  },
+  error(message, fields) {
+    runtime.console.error(message, fields);
+  },
+};
 
 export function resolveConfig<TRequest>(
   options: IdemfenceOptions<TRequest>,
@@ -192,39 +265,10 @@ export function resolveConfig<TRequest>(
 
   const retention = parseDuration("retention", options.retention ?? "24h");
   const lease = parseDuration("lease", options.lease ?? "30s");
-  const storeUnavailableRetryAfter = parseDuration(
-    "storeUnavailableRetryAfter",
-    options.storeUnavailableRetryAfter ?? "5s",
-  );
   if (lease >= retention) {
     throw new IdemfenceConfigError(
       "LEASE_NOT_SHORTER_THAN_RETENTION",
       "Option `lease` must be shorter than option `retention`.",
-    );
-  }
-
-  const keyMaxLength = options.keyMaxLength ?? 255;
-  if (
-    !Number.isInteger(keyMaxLength) ||
-    keyMaxLength < 1 ||
-    keyMaxLength > 255
-  ) {
-    throw new IdemfenceConfigError(
-      "KEY_MAX_LENGTH_INVALID",
-      "Option `keyMaxLength` must be an integer from 1 to 255.",
-    );
-  }
-
-  const releaseStatuses = options.releaseStatuses ?? [408, 425, 429];
-  if (
-    !Array.isArray(releaseStatuses) ||
-    !releaseStatuses.every(
-      (status) => Number.isInteger(status) && status >= 400 && status <= 599,
-    )
-  ) {
-    throw new IdemfenceConfigError(
-      "RELEASE_STATUS_INVALID",
-      "Option `releaseStatuses` must contain only integer status codes from 400 to 599; releasing a success or redirect status would let a completed operation run twice.",
     );
   }
 
@@ -240,16 +284,123 @@ export function resolveConfig<TRequest>(
     docsUrl: httpsUrl(options.docsUrl),
     retention,
     lease,
-    keyMaxLength,
+    keyMaxLength: keyMaxLength(options.keyMaxLength),
     keySyntax: keySyntax(options.keySyntax),
     requestBodyCap: bodyCap("requestBodyCap", options.requestBodyCap),
     responseBodyCap: bodyCap("responseBodyCap", options.responseBodyCap),
-    storeUnavailableRetryAfter,
-    releaseStatuses: Object.freeze([...releaseStatuses]),
+    storeUnavailableRetryAfter: parseDuration(
+      "storeUnavailableRetryAfter",
+      options.storeUnavailableRetryAfter ?? "5s",
+    ),
+    releaseStatuses: releaseStatuses(options.releaseStatuses),
     namespace: namespace(options.namespace),
     headerAllowlist: headerAllowlist(options.headerAllowlist),
-    required: requiredFlag(options.required),
+    required: booleanOption(
+      "required",
+      "REQUIRED_INVALID",
+      options.required,
+      true,
+    ),
+    logger: logger(options.logger),
   });
+}
+
+/** Validates a route and applies its overrides on top of the resolved configuration. */
+export function resolveRoute<TRequest>(
+  config: ResolvedConfig<TRequest>,
+  route: RouteConfig,
+): ResolvedRoute {
+  const template: unknown = route.routeTemplate;
+  if (typeof template !== "string" || !ROUTE_TEMPLATE_PATTERN.test(template)) {
+    throw new IdemfenceConfigError(
+      "ROUTE_TEMPLATE_INVALID",
+      "Route option `routeTemplate` must be 1 to 2048 printable ASCII characters starting with `/`.",
+    );
+  }
+  return Object.freeze({
+    routeTemplate: template,
+    required: booleanOption(
+      "required",
+      "REQUIRED_INVALID",
+      route.required,
+      config.required,
+    ),
+    keySyntax:
+      route.keySyntax === undefined
+        ? config.keySyntax
+        : keySyntax(route.keySyntax),
+    keyMaxLength:
+      route.keyMaxLength === undefined
+        ? config.keyMaxLength
+        : keyMaxLength(route.keyMaxLength),
+    requestBodyCap:
+      route.requestBodyCap === undefined
+        ? config.requestBodyCap
+        : bodyCap("requestBodyCap", route.requestBodyCap),
+    responseBodyCap:
+      route.responseBodyCap === undefined
+        ? config.responseBodyCap
+        : bodyCap("responseBodyCap", route.responseBodyCap),
+    releaseStatuses:
+      route.releaseStatuses === undefined
+        ? config.releaseStatuses
+        : releaseStatuses(route.releaseStatuses),
+    headerAllowlist:
+      route.headerAllowlist === undefined
+        ? config.headerAllowlist
+        : headerAllowlist(route.headerAllowlist),
+    storeUnavailableRetryAfter:
+      route.storeUnavailableRetryAfter === undefined
+        ? config.storeUnavailableRetryAfter
+        : parseDuration(
+            "storeUnavailableRetryAfter",
+            route.storeUnavailableRetryAfter,
+          ),
+    allowSetCookieReplay: booleanOption(
+      "allowSetCookieReplay",
+      "ROUTE_FLAG_INVALID",
+      route.allowSetCookieReplay,
+      false,
+    ),
+    failOpen: booleanOption(
+      "failOpen",
+      "ROUTE_FLAG_INVALID",
+      route.failOpen,
+      false,
+    ),
+  });
+}
+
+function keyMaxLength(value: unknown): number {
+  const resolved = value ?? 255;
+  if (
+    typeof resolved !== "number" ||
+    !Number.isInteger(resolved) ||
+    resolved < 1 ||
+    resolved > 255
+  ) {
+    throw new IdemfenceConfigError(
+      "KEY_MAX_LENGTH_INVALID",
+      "Option `keyMaxLength` must be an integer from 1 to 255.",
+    );
+  }
+  return resolved;
+}
+
+function releaseStatuses(value: unknown): readonly number[] {
+  const resolved = value ?? [408, 425, 429];
+  if (
+    !Array.isArray(resolved) ||
+    !resolved.every(
+      (status) => Number.isInteger(status) && status >= 400 && status <= 599,
+    )
+  ) {
+    throw new IdemfenceConfigError(
+      "RELEASE_STATUS_INVALID",
+      "Option `releaseStatuses` must contain only integer status codes from 400 to 599; releasing a success or redirect status would let a completed operation run twice.",
+    );
+  }
+  return Object.freeze([...resolved]);
 }
 
 function keySyntax(value: unknown): KeySyntax {
@@ -302,15 +453,36 @@ function headerAllowlist(value: unknown): readonly string[] {
   return Object.freeze([...resolved]);
 }
 
-function requiredFlag(value: unknown): boolean {
-  const resolved = value ?? true;
+function booleanOption(
+  option: string,
+  code: "REQUIRED_INVALID" | "ROUTE_FLAG_INVALID",
+  value: unknown,
+  fallback: boolean,
+): boolean {
+  const resolved = value ?? fallback;
   if (typeof resolved !== "boolean") {
     throw new IdemfenceConfigError(
-      "REQUIRED_INVALID",
-      "Option `required` must be a boolean.",
+      code,
+      `Option \`${option}\` must be a boolean.`,
     );
   }
   return resolved;
+}
+
+function logger(value: unknown): Logger {
+  const resolved = value ?? defaultLogger;
+  if (
+    typeof resolved !== "object" ||
+    resolved === null ||
+    typeof (resolved as Logger).warn !== "function" ||
+    typeof (resolved as Logger).error !== "function"
+  ) {
+    throw new IdemfenceConfigError(
+      "LOGGER_INVALID",
+      "Option `logger` must be an object with warn and error functions.",
+    );
+  }
+  return resolved as Logger;
 }
 
 function secretBytes(option: string, value: unknown): Uint8Array {
