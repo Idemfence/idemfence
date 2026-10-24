@@ -223,7 +223,8 @@ operator's own published idempotency documentation, which Section 2.5.2 of the d
 requires every resource to publish. There is no default. idemfence ships
 `docs/api-contract-template.md` (step 4.5), a template for that documentation containing
 the anchors this section defines. A 500 for a handler throw (rows 12 and 13) uses the type
-`about:blank`.
+`about:blank`. `Link` is sent for every problem type defined in this section; it is omitted
+for `about:blank`, which links to nothing.
 
 ### key-missing
 

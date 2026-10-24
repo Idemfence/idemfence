@@ -112,7 +112,8 @@ export function problemResponse(
 
 /**
  * The 500 for a handler failure (contract rows 12 and 13): type `about:blank`, so the title is
- * the status phrase. The detail is generic and never includes the handler's error.
+ * the status phrase and no Link header is sent. The detail is generic and never includes the
+ * handler's error.
  */
 export function internalProblemResponse(
   detail = "The request could not be processed because of an internal error.",
@@ -126,10 +127,7 @@ export function internalProblemResponse(
     }),
     {
       status: 500,
-      headers: {
-        "content-type": "application/problem+json",
-        link: '<about:blank>; rel="describedby"',
-      },
+      headers: { "content-type": "application/problem+json" },
     },
   );
 }

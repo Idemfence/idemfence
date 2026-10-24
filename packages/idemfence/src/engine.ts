@@ -128,14 +128,22 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       return handler(request, passthroughContext);
     }
 
-    // Row 4. An empty principal counts as missing.
-    const principal = config.scope(request);
-    if (principal === undefined || principal === "") {
+    // Row 4, fail closed: a scope that throws, or returns anything but a non-empty
+    // string, leaves the request unprocessed.
+    let principal: unknown;
+    let scopeError: unknown;
+    try {
+      principal = config.scope(request);
+    } catch (error) {
+      scopeError = error;
+    }
+    if (typeof principal !== "string" || principal === "") {
       logger.error(
         "idemfence: scope returned no principal; request not processed",
         {
           row: 4,
           outcome: "configuration-error",
+          ...(scopeError === undefined ? {} : { error: errorInfo(scopeError) }),
         },
       );
       return problem(route, "configuration-error");
@@ -234,9 +242,11 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     };
 
     let response: Response;
+    let threw = false;
     try {
       response = await handler(request, ctx);
     } catch (error) {
+      threw = true;
       // Row 12: side effects may have happened, so the failure is stored and replayed.
       logger.error("idemfence: handler threw; storing a 500 problem", {
         keyHash,
@@ -247,8 +257,9 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       response = internalProblemResponse();
     }
 
-    // Row 11.
-    if (route.releaseStatuses.includes(response.status)) {
+    // Row 11 applies only to a response the handler returned: a throw is always stored
+    // (row 12), even when 500 is a release status.
+    if (!threw && route.releaseStatuses.includes(response.status)) {
       try {
         if ((await store.release(key, fencingToken)) === "fenced") {
           logger.warn("idemfence: release was fenced", {

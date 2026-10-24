@@ -166,9 +166,7 @@ async function expectProblem(
   const body = (await response.json()) as Record<string, unknown>;
   if (kind === "about:blank") {
     expect(body.type).toBe("about:blank");
-    expect(response.headers.get("link")).toBe(
-      '<about:blank>; rel="describedby"',
-    );
+    expect(response.headers.get("link")).toBeNull();
   } else {
     expect(body.type).toBe(`${DOCS}#${kind}`);
     expect(response.headers.get("link")).toBe(
@@ -250,6 +248,47 @@ describe("rows 1 to 4: before the store", () => {
         }),
       ]);
     }
+    expect(calls).toHaveLength(0);
+    expect(await recordCount()).toBe(before);
+  });
+  it("row 4: a scope that throws or returns a non-string fails closed", async () => {
+    const throwing = makeEngine({
+      scope: () => {
+        throw new Error("auth context missing");
+      },
+    });
+    const nonString = makeEngine({ scope: () => 42 as unknown as string });
+    const { handler, calls } = counting();
+    const before = await recordCount();
+
+    let mark = logs.length;
+    await expectProblem(
+      await throwing.handle(req(freshKey(), { body: "{}" }), ROUTE, handler),
+      500,
+      "configuration-error",
+    );
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: {
+          row: 4,
+          outcome: "configuration-error",
+          error: { name: "Error" },
+        },
+      }),
+    ]);
+
+    mark = logs.length;
+    await expectProblem(
+      await nonString.handle(req(freshKey(), { body: "{}" }), ROUTE, handler),
+      500,
+      "configuration-error",
+    );
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        fields: { row: 4, outcome: "configuration-error" },
+      }),
+    ]);
     expect(calls).toHaveLength(0);
     expect(await recordCount()).toBe(before);
   });
@@ -540,6 +579,46 @@ describe("rows 11 and 12: after the handler", () => {
     expect(calls).toBe(1);
     expect(replay.status).toBe(500);
     expect(replay.headers.get("idempotent-replayed")).toBe("true");
+  });
+
+  it("row 11 vs 12: a throw is stored even when 500 is a release status; a returned 500 is released", async () => {
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      releaseStatuses: [500],
+    };
+    const thrownKey = freshKey();
+    let throws = 0;
+    const thrower = async () => {
+      throws += 1;
+      throw new Error("boom");
+    };
+    expect(
+      (await engine.handle(req(thrownKey, { body: "{}" }), route, thrower))
+        .status,
+    ).toBe(500);
+    expect(await record(thrownKey)).toMatchObject({
+      state: "completed",
+      response_status: 500,
+    });
+    const replay = await engine.handle(
+      req(thrownKey, { body: "{}" }),
+      route,
+      thrower,
+    );
+    expect(throws).toBe(1);
+    expect(replay.headers.get("idempotent-replayed")).toBe("true");
+
+    const returnedKey = freshKey();
+    const { handler, calls } = counting(
+      () => new Response("fail", { status: 500 }),
+    );
+    expect(
+      (await engine.handle(req(returnedKey, { body: "{}" }), route, handler))
+        .status,
+    ).toBe(500);
+    expect(await record(returnedKey)).toBeUndefined();
+    await engine.handle(req(returnedKey, { body: "{}" }), route, handler);
+    expect(calls).toHaveLength(2);
   });
 
   it("row 12: a 5xx returned by the handler is stored and replayed", async () => {
