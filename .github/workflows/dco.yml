@@ -21,6 +21,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
 
@@ -33,6 +34,14 @@ jobs:
           failed=0
           for sha in ${commits}; do
             author=$(git log -1 --format='%an <%ae>' "${sha}")
+            author_email=$(git log -1 --format='%ae' "${sha}")
+            # Dependabot cannot sign off. Skip a commit only when Dependabot opened the PR (not
+            # forgeable) AND authored the commit, so human commits pushed onto its PRs are checked.
+            if [ "${PR_USER}" = "dependabot[bot]" ] \
+              && [ "${author_email}" = "49699333+dependabot[bot]@users.noreply.github.com" ]; then
+              echo "skip    ${sha} ${author} (Dependabot commit on a Dependabot pull request)"
+              continue
+            fi
             signoffs=$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly,unfold)' "${sha}" \
               | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if printf '%s\n' "${signoffs}" | grep -Fxq -- "${author}"; then
