@@ -123,7 +123,7 @@ row 1; then the key checks (rows 2 and 3); then the principal (row 4); then the 
 | 11 | Handler status is in the release set (default 408, 425, 429) | The handler's response is returned as-is. | Deleted, so the key can be retried. In transactional mode the handler's transaction is rolled back. 503 is not in the default set because it can follow a side effect. |
 | 12 | Handler throws, or returns any other status (including 5xx) | The response is returned; a throw becomes a 500 problem (`about:blank`). | Completed: stored and replayed on retry, because side effects may have happened. |
 | 13 | Handler throws in transactional mode | 500 problem (`about:blank`). | Rolled back together with the handler's writes; the key is free to retry. |
-| 14 | Store unavailable | 503 [store-unavailable](#store-unavailable) with `Retry-After` (fail closed). | None. |
+| 14 | Store unavailable | 503 [store-unavailable](#store-unavailable) with `Retry-After` (default 5 seconds, configurable per route) (fail closed). | None. |
 | 15 | Request body over the fingerprint cap | 413 [body-too-large](#body-too-large). | None. |
 | 16 | Client disconnects mid-request | The handler is not aborted. | The response is stored; a retry replays it. |
 
@@ -141,10 +141,21 @@ Further requirements:
 ## 5. Responses
 
 1. **Store-then-send.** The response MUST be stored, and the record completed, before any
-   byte of it is sent. If completing the record fails, the handler's response MUST NOT be
-   sent; the middleware responds 503 [store-unavailable](#store-unavailable). In lease mode
-   the record then stays in flight until its lease expires (row 8, then row 9). In
-   transactional mode the handler's writes roll back with the record.
+   byte of it is sent. If the write fails after the handler has finished:
+   - **Lease mode.** The middleware MUST retry the complete write up to 3 times with bounded
+     backoff, no more than 1 second in total. A write rejected as fenced (row 9) is not
+     retried. If the write still fails, the middleware MUST send the handler's actual
+     response, log an error, and emit a `store_error` event. It MUST NOT respond 503 in this
+     case: a 503 invites a retry, and once the lease expires that retry re-executes the
+     handler (row 9), whereas the real response stops a well-behaved client from retrying.
+     The record stays in flight until its lease expires. The residual risk is that the
+     response is lost in transit and the client retries after the lease has expired, which
+     runs the handler again. Handlers SHOULD guard downstream side effects with derived
+     downstream keys, which are identical on every attempt.
+   - **Transactional mode.** The record write is part of the handler's transaction, so a
+     failure rolls back the record and the handler's writes together. The middleware MUST
+     respond 503 [store-unavailable](#store-unavailable) with `Retry-After`. A retry is safe
+     by construction.
 2. Responses are buffered in full. Streaming responses are not supported on configured
    routes.
 3. **Header denylist.** These response headers MUST NOT be stored or replayed:
@@ -168,8 +179,13 @@ Further requirements:
 
 Every error that idemfence generates is an `application/problem+json` body
 ([RFC 9457][rfc9457]) with `type`, `title`, `status` and `detail` members, sent with
-`Link: <type-uri>; rel="describedby"`. Responses for rows 8 and 14 also carry
-`Retry-After`.
+`Link: <type-uri>; rel="describedby"`. Responses for row 8 (in both modes), row 14, and
+the transactional-mode 503 in section 5 also carry `Retry-After`.
+
+Every `Retry-After` that idemfence emits is delay-seconds (Section 10.2.3 of
+[RFC 9110][rfc9110]): a whole number of seconds, rounded up, with a minimum of 1. This
+applies to the remaining lease (row 8, lease mode), the lock timeout (row 8, transactional
+mode), and the configured store-unavailable delay (row 14, default 5 seconds).
 
 A problem `type` URI is the configured documentation URL followed by `#` and the anchor
 below. The documentation URL MUST use HTTPS. It defaults to this document at the release
@@ -196,8 +212,9 @@ seconds in `Retry-After`. Row 8.
 
 ### store-unavailable
 
-503. The idempotency store could not be reached, or the response could not be stored.
-Retry after the number of seconds in `Retry-After`. Row 14 and section 5.
+503. The idempotency store could not be reached (row 14), or, in transactional mode, the
+record could not be written with the handler's transaction (section 5). Retry after the
+number of seconds in `Retry-After`.
 
 ### body-too-large
 
