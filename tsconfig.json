@@ -1,7 +1,14 @@
 {
   "files": [],
   "references": [
-    { "path": "packages/idemfence" },
-    { "path": "packages/conformance" }
+    {
+      "path": "packages/idemfence"
+    },
+    {
+      "path": "packages/conformance"
+    },
+    {
+      "path": "reference-app"
+    }
   ]
 }

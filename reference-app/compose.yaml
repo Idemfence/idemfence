@@ -1,0 +1,56 @@
+name: idemfence-reference-app
+
+services:
+  postgres:
+    # postgres:18.4, pushed 2026-08-06; the same digest CI tests against.
+    image: postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+    environment:
+      POSTGRES_USER: idemfence
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (see .env.example)}
+      POSTGRES_DB: idemfence
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U idemfence -d idemfence"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  # Applies idemfence's schema and the app's table once, then exits. The app never migrates.
+  migrate:
+    image: postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://idemfence:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (see .env.example)}@postgres:5432/idemfence
+    volumes:
+      - ../packages/idemfence/migrations/001_init.sql:/migrations/001_init.sql:ro
+      - ./migrations/002_orders.sql:/migrations/002_orders.sql:ro
+      - ./migrate.sh:/migrate.sh:ro
+    command: ["sh", "/migrate.sh"]
+    restart: "no"
+
+  app:
+    build:
+      context: ..
+      dockerfile: reference-app/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://idemfence:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (see .env.example)}@postgres:5432/idemfence
+      IDEMFENCE_SECRET: ${IDEMFENCE_SECRET:?set IDEMFENCE_SECRET (see .env.example)}
+      DOCS_URL: ${DOCS_URL:-https://github.com/idemfence/idemfence/blob/main/docs/contract.md}
+      PORT: "3000"
+    ports:
+      - "${PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  pgdata:

@@ -2,6 +2,7 @@ node_modules/
 dist/
 coverage/
 .env*
+!.env.example
 .claude/settings.local.json
 *.tsbuildinfo
 .idea/

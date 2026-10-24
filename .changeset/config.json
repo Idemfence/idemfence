@@ -5,7 +5,7 @@
   "format": "auto",
   "changelog": "@changesets/cli/changelog",
   "commit": false,
-  "ignore": [],
+  "ignore": ["idemfence-reference-app"],
   "fixed": [],
   "linked": [],
   "updateInternalDependencies": "patch"

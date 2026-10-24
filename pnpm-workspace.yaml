@@ -1,5 +1,6 @@
 packages:
   - packages/*
+  - reference-app
 
 # Only install versions published at least 14 days ago (in minutes).
 minimumReleaseAge: 20160
