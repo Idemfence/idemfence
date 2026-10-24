@@ -8,6 +8,7 @@ import { type ServerType, serve } from "@hono/node-server";
 import { Hono } from "hono";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { isBodyTooLargeResponse } from "../src/engine.js";
 import { idempotent } from "../src/fetch.js";
 import { lookupKey } from "../src/hash.js";
 import { createIdemfence, type Idemfence, type Logger } from "../src/index.js";
@@ -130,12 +131,31 @@ beforeAll(async () => {
     { routeTemplate: "/unavailable" },
     async () => Response.json({ never: true }),
   );
+  // A handler's own 413 that imitates the engine's problem response, headers included.
+  const own413 = idempotent(
+    idem,
+    { routeTemplate: "/own413" },
+    async (request) => {
+      await request.text();
+      return new Response(
+        JSON.stringify({ type: `${DOCS}#body-too-large`, status: 413 }),
+        {
+          status: 413,
+          headers: {
+            "content-type": "application/problem+json",
+            link: `<${DOCS}#body-too-large>; rel="describedby"`,
+          },
+        },
+      );
+    },
+  );
   app.all("/orders", (c) => orders(c.req.raw));
   app.all("/slow", (c) => slow(c.req.raw));
   app.all("/release", (c) => release(c.req.raw));
   app.all("/throws", (c) => throws(c.req.raw));
   app.all("/methods", (c) => methods(c.req.raw));
   app.all("/unavailable", (c) => unavailable(c.req.raw));
+  app.all("/own413", (c) => own413(c.req.raw));
 
   port = await new Promise<number>((resolve) => {
     server = serve(
@@ -463,6 +483,46 @@ async function uploadUntilClosed(head: string, chunk: Buffer, framed: boolean) {
   );
   return { response, written, elapsedMs };
 }
+
+describe("row 15 marker", () => {
+  it("a handler's own 413 is never given Connection: close, whatever its headers", async () => {
+    const response = await fetch(`${base}/own413`, {
+      method: "POST",
+      headers: headers(freshKey()),
+      body: "{}",
+    });
+    expect(response.status).toBe(413);
+    expect(response.headers.get("link")).toBe(
+      `<${DOCS}#body-too-large>; rel="describedby"`,
+    );
+    expect(response.headers.get("connection")).not.toBe("close");
+  });
+
+  it("only the engine's row-15 response carries the marker", async () => {
+    const idem = createIdemfence({
+      store: postgresStore({ pool, schema }),
+      scope: () => "user-1",
+      secret: SECRET,
+      docsUrl: DOCS,
+      logger,
+      requestBodyCap: 8,
+    });
+    const engine413 = await idem.handle(
+      new Request("https://api.example.com/x", {
+        method: "POST",
+        headers: { "idempotency-key": `"${freshKey()}"` },
+        body: "x".repeat(9),
+      }),
+      { routeTemplate: "/x" },
+      async () => new Response(),
+    );
+    expect(engine413.status).toBe(413);
+    expect(isBodyTooLargeResponse(engine413)).toBe(true);
+    expect(isBodyTooLargeResponse(new Response("mine", { status: 413 }))).toBe(
+      false,
+    );
+  });
+});
 
 describe("row 15 over a raw socket", () => {
   const chunk = Buffer.alloc(64 * 1024, 0x61);

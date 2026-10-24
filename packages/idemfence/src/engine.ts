@@ -71,6 +71,15 @@ const HEADER_DENYLIST = new Set([
   "tracestate",
 ]);
 
+// Responses the engine generated for row 15, so an adapter can close the connection without
+// inspecting headers; a handler's own 413 is never in this set.
+const bodyTooLargeResponses = new WeakSet<Response>();
+
+/** True only for a 413 the engine itself produced for contract row 15. */
+export function isBodyTooLargeResponse(response: Response): boolean {
+  return bodyTooLargeResponses.has(response);
+}
+
 const passthroughContext: HandlerContext = {
   async renew() {},
 };
@@ -154,7 +163,9 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     // Row 15.
     const printed = await fingerprint(request, route);
     if ("error" in printed) {
-      return problem(route, "body-too-large");
+      const response = problem(route, "body-too-large");
+      bodyTooLargeResponses.add(response);
+      return response;
     }
 
     const key = await lookupKey({

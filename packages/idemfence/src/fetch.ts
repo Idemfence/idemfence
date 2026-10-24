@@ -1,5 +1,5 @@
 import { IdemfenceConfigError, type RouteConfig } from "./config.js";
-import type { Handler } from "./engine.js";
+import { type Handler, isBodyTooLargeResponse } from "./engine.js";
 import type { Idemfence } from "./index.js";
 
 export type { Handler, HandlerContext } from "./engine.js";
@@ -32,18 +32,15 @@ export function idempotent(
   const methods = new Set(validMethods(route.methods));
   // The engine caches validation by route object identity, so one object is built here.
   const { methods: _ignored, ...engineRoute } = route;
-  const bodyTooLarge = `#body-too-large>; rel="describedby"`;
 
   return async (request) => {
     if (!methods.has(request.method)) {
       return handler(request, passthroughContext);
     }
     const response = await idem.handle(request, engineRoute, handler);
-    // Row 15: close the connection rather than read the rest of the upload.
-    if (
-      response.status === 413 &&
-      (response.headers.get("link") ?? "").endsWith(bodyTooLarge)
-    ) {
+    // Row 15: close the connection rather than read the rest of the upload. Only the
+    // engine's own 413 is marked; a handler's 413 is returned untouched.
+    if (isBodyTooLargeResponse(response)) {
       response.headers.set("connection", "close");
     }
     return response;
