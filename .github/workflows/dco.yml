@@ -11,13 +11,21 @@ jobs:
     name: dco
     runs-on: ubuntu-latest
     steps:
+      # Dependabot cannot sign off. Exempt only PRs that Dependabot itself opened: the PR
+      # opener cannot be forged, unlike commit author fields.
+      - name: Exempt Dependabot pull request
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        run: echo "::notice::Pull request opened by dependabot[bot]; DCO sign-off check skipped."
+
       - name: Check out
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Check Signed-off-by trailers
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
