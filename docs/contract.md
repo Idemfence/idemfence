@@ -1,0 +1,250 @@
+# idemfence behaviour contract
+
+**Status:** normative draft for idemfence 1.0. No implementation has been released yet; this
+document defines the behaviour that every release MUST implement.
+
+This document specifies how idemfence handles requests that carry the `Idempotency-Key`
+header field defined by the IETF Internet-Draft
+[The Idempotency-Key HTTP Header Field][draft] (draft-ietf-httpapi-idempotency-key-header-08,
+22 October 2026). Error responses use Problem Details for HTTP APIs ([RFC 9457][rfc9457]).
+
+Where the draft says SHOULD for a status code (400, 409, 422), this contract says MUST.
+
+## Conventions
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT",
+"RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
+interpreted as described in BCP 14 ([RFC 2119][rfc2119], [RFC 8174][rfc8174]) when, and only
+when, they appear in all capitals, as shown here.
+
+Terms used below:
+
+- **Configured route**: a route template and HTTP method that the application has explicitly
+  placed under idemfence.
+- **Principal**: the authenticated identity that owns a key, as returned by the configured
+  scope function (for example a user ID or API client ID).
+- **Record**: the stored state for one lookup key: in flight or completed, the request
+  fingerprint, the fencing token and, once completed, the stored response.
+- **Lease**: a time-limited, exclusive claim on an in-flight record, measured on the store's
+  clock.
+- **Fencing token**: an integer stored with the record that increases by at least one each
+  time a lease is acquired.
+- **Retention**: how long a record is kept after it is created. It is configured per route
+  and MUST be longer than the lease.
+
+### Length-prefixed encoding
+
+`enc(x)` is the byte length of `x` as an unsigned 64-bit big-endian integer, followed by the
+bytes of `x`. Text values are encoded as UTF-8. A hash input is the concatenation of `enc()`
+of each listed field, in order. Every hash input starts with a fixed domain tag, so a lookup
+key can never equal a fingerprint.
+
+## 1. Scope
+
+1. idemfence MUST apply only to configured routes and methods. Every other request MUST pass
+   through untouched (row 1).
+2. The middleware MUST run after authentication, so that the principal is known when the
+   lookup key is computed.
+3. The middleware MUST have access to the raw request body bytes before any body parser
+   consumes them.
+
+## 2. Key
+
+1. The `Idempotency-Key` field is an Item Structured Field whose value MUST be a String
+   (Section 3.3.3 of [RFC 9651][rfc9651]), as required by Section 2.1 of the draft. For
+   example: `Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"`.
+2. The decoded String MUST be 1 to 255 characters long. The maximum is configurable per
+   route.
+3. Every character of the decoded String MUST be printable ASCII (0x20 to 0x7E). A field
+   that does not parse as an sf-string, is too long, or contains any other character is
+   malformed (row 3).
+4. A configured route requires a key by default. A route MAY be configured with the key
+   optional; a request without a key on such a route is handled as in row 1.
+5. The lookup key is:
+
+   ```
+   SHA-256( enc("idemfence/lookup/v1") || enc(namespace) || enc(principal)
+            || enc(method) || enc(route template) || enc(client key) )
+   ```
+
+   where `namespace` is the configured namespace string, `method` is the request method as
+   received, `route template` is the configured template (for example `/orders/:id`), and
+   `client key` is the decoded String from the header.
+6. Raw client keys MUST NOT be stored. Only the lookup key is persisted. Raw client keys
+   SHOULD NOT be logged.
+
+## 3. Fingerprint
+
+1. The request fingerprint is:
+
+   ```
+   SHA-256( enc("idemfence/fingerprint/v1") || enc(method) || enc(concrete path)
+            || enc(canonical query) || enc(content type) || enc(header block)
+            || enc(body) )
+   ```
+
+2. `concrete path` is the request path exactly as received, without the query and without
+   decoding or normalisation.
+3. `canonical query` is the query parsed with the WHATWG `application/x-www-form-urlencoded`
+   parser, stably sorted by name (as `URLSearchParams.prototype.sort()` does, which keeps
+   the relative order of repeated names), then serialised with the same format. An absent
+   query and an empty query both produce the empty string.
+4. `content type` is one byte `0x00` if `Content-Type` is absent, otherwise one byte `0x01`
+   followed by the field value as received.
+5. `header block` covers the headers in the route's fingerprint allowlist, which is empty by
+   default. For each allowlisted name, in ascending order of its lowercase form, it contains
+   `enc(lowercase name)` followed by `enc(0x00)` if the header is absent, or
+   `enc(0x01 || combined field value)` if it is present. The combined value joins multiple
+   field lines with `", "` (Section 5.3 of [RFC 9110][rfc9110]).
+6. `body` is the raw request body bytes, before any content decoding or parsing.
+7. The body MUST be buffered up to the route's fingerprint cap (default 1 MiB) and hashed
+   once. If `Content-Length` exceeds the cap, or the bytes read exceed it, the middleware
+   MUST stop reading and respond 413 immediately (row 15).
+
+## 4. Behaviour
+
+The middleware evaluates a request in this order and the first matching row applies:
+row 1; then the key checks (rows 2 and 3); then the principal (row 4); then the body cap
+(row 15); then the store (row 14); then the record state (rows 5 to 10). Rows 11, 12, 13 and
+16 describe what happens after the handler runs.
+
+| #  | Situation | Behaviour | Record |
+| -- | --------- | --------- | ------ |
+| 1  | Route or method not configured | Pass through untouched; any `Idempotency-Key` is ignored. | None. |
+| 2  | Key required but missing | 400 [key-missing](#key-missing). | None. |
+| 3  | Key malformed (not an sf-string, too long, or bad characters) | 400 [key-malformed](#key-malformed). | None. |
+| 4  | No principal while scoping is required | 500 [configuration-error](#configuration-error), logged as a configuration error (fail closed). | None. |
+| 5  | First request for the lookup key | The handler runs. A lease is acquired before it starts. | Created in flight; the response is stored per policy (section 5). |
+| 6  | Completed key, same fingerprint | The stored response is replayed with `Idempotent-Replayed: true`. The handler does not run. | Unchanged. |
+| 7  | Completed key, different fingerprint | 422 [key-reused](#key-reused). | Unchanged. |
+| 8  | In-flight key, lease valid | 409 [in-flight](#in-flight) with `Retry-After` set to the remaining lease in whole seconds, rounded up (minimum 1). | Unchanged. |
+| 9  | In-flight key, lease expired | The handler runs as a new attempt. | The lease is taken over and the fencing token incremented. A late complete, release or renew from the previous holder is rejected. |
+| 10 | Key older than retention | Treated as a first request (row 5). | The old record is replaced. |
+| 11 | Handler status is in the release set (default 408, 425, 429) | The handler's response is returned as-is. | Deleted, so the key can be retried. In transactional mode the handler's transaction is rolled back. 503 is not in the default set because it can follow a side effect. |
+| 12 | Handler throws, or returns any other status (including 5xx) | The response is returned; a throw becomes a 500 problem (`about:blank`). | Completed: stored and replayed on retry, because side effects may have happened. |
+| 13 | Handler throws in transactional mode | 500 problem (`about:blank`). | Rolled back together with the handler's writes; the key is free to retry. |
+| 14 | Store unavailable | 503 [store-unavailable](#store-unavailable) with `Retry-After` (fail closed). | None. |
+| 15 | Request body over the fingerprint cap | 413 [body-too-large](#body-too-large). | None. |
+| 16 | Client disconnects mid-request | The handler is not aborted. | The response is stored; a retry replays it. |
+
+Further requirements:
+
+- Row 9: fencing tokens MUST be compared and set atomically by the store on every complete,
+  release and renew. A write carrying a stale token MUST change nothing and MUST be reported
+  to the caller as fenced.
+- Row 12 applies in lease mode, and in transactional mode for every outcome except a throw.
+- Row 14: fail-open (running the handler without idemfence when the store is unavailable)
+  MAY be enabled only as an explicit per-route opt-in. Every fail-open request MUST be
+  logged at warn level.
+- Row 16: a client disconnect MUST NOT fire the handler's abort signal.
+
+## 5. Responses
+
+1. **Store-then-send.** The response MUST be stored, and the record completed, before any
+   byte of it is sent. If completing the record fails, the handler's response MUST NOT be
+   sent; the middleware responds 503 [store-unavailable](#store-unavailable). In lease mode
+   the record then stays in flight until its lease expires (row 8, then row 9). In
+   transactional mode the handler's writes roll back with the record.
+2. Responses are buffered in full. Streaming responses are not supported on configured
+   routes.
+3. **Header denylist.** These response headers MUST NOT be stored or replayed:
+   - hop-by-hop headers: `Connection`, `Keep-Alive`, `Proxy-Authenticate`,
+     `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, and any header
+     named in `Connection`;
+   - `Content-Length`, which is recomputed on replay;
+   - `Date`;
+   - `Server-Timing`;
+   - `traceparent` and `tracestate`;
+   - `Set-Cookie`, unless the route explicitly allows it.
+4. **Body cap.** Each route has a response body cap (default 1 MiB). If the body exceeds
+   it, the original response is still sent in full and the record is still completed, with
+   the status and stored headers but without the body. A metric and an error log entry MUST
+   be emitted when the record is written. A replay of such a record returns the original
+   status and stored headers (including `Location` and `ETag`), an empty body, and
+   `Idempotent-Body-Omitted: true`.
+5. Every replay carries `Idempotent-Replayed: true`.
+
+## 6. Errors
+
+Every error that idemfence generates is an `application/problem+json` body
+([RFC 9457][rfc9457]) with `type`, `title`, `status` and `detail` members, sent with
+`Link: <type-uri>; rel="describedby"`. Responses for rows 8 and 14 also carry
+`Retry-After`.
+
+A problem `type` URI is the configured documentation URL followed by `#` and the anchor
+below. The documentation URL MUST use HTTPS. It defaults to this document at the release
+tag of the installed version. A 500 for a handler throw (rows 12 and 13) uses the type
+`about:blank`.
+
+### key-missing
+
+400. The route requires an `Idempotency-Key` and the request has none. Row 2.
+
+### key-malformed
+
+400. The `Idempotency-Key` is not an sf-string, is longer than the route's maximum, or
+contains characters outside 0x20 to 0x7E. Row 3.
+
+### key-reused
+
+422. The key was already used with a request whose fingerprint differs. Row 7.
+
+### in-flight
+
+409. A request with the same key is still being processed. Retry after the number of
+seconds in `Retry-After`. Row 8.
+
+### store-unavailable
+
+503. The idempotency store could not be reached, or the response could not be stored.
+Retry after the number of seconds in `Retry-After`. Row 14 and section 5.
+
+### body-too-large
+
+413. The request body exceeds the route's fingerprint cap. Row 15.
+
+### configuration-error
+
+500. idemfence is misconfigured, for example no principal is available while scoping is
+required. The error is logged; the request is not processed. Row 4.
+
+## 7. Modes
+
+**Lease mode** (Postgres or Redis). The record is claimed with a lease and a fencing token.
+The lease is renewed while the handler runs; every complete, release and renew is a
+compare-and-set on the fencing token (row 9). All lease times MUST come from the store's
+clock (Postgres `clock_timestamp()`, Redis `TIME`). Application server clocks MUST NOT be
+used for lease decisions.
+
+**Transactional mode** (Postgres). The record is written inside the handler's own database
+transaction, so the record and the handler's writes commit or roll back together (rows 11
+and 13). A concurrent request with the same key waits on the uncommitted record up to the
+configured lock timeout, then receives 409 [in-flight](#in-flight) with `Retry-After` set to
+that timeout in whole seconds, rounded up (minimum 1). Row 9 does not apply: a crashed
+handler's transaction rolls back and frees the key.
+
+## 8. Versioning
+
+Any change to observable behaviour defined in this document is a semver-major change. This
+includes status codes, headers, problem types, the evaluation order, and the lookup key and
+fingerprint encodings. Editorial changes that do not alter behaviour are not.
+
+## References
+
+- [The Idempotency-Key HTTP Header Field][draft]: J. Jena, S. Dalal, D. Tishkin,
+  draft-ietf-httpapi-idempotency-key-header-08, 22 October 2026.
+- [RFC 2119][rfc2119], [RFC 8174][rfc8174]: Key words for use in RFCs to indicate
+  requirement levels.
+- [RFC 9110][rfc9110]: HTTP Semantics.
+- [RFC 9457][rfc9457]: Problem Details for HTTP APIs.
+- [RFC 9651][rfc9651]: Structured Field Values for HTTP (obsoletes RFC 8941).
+- [WHATWG URL Standard][whatwg-url]: `application/x-www-form-urlencoded` and
+  `URLSearchParams`.
+
+[draft]: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-08
+[rfc2119]: https://www.rfc-editor.org/rfc/rfc2119
+[rfc8174]: https://www.rfc-editor.org/rfc/rfc8174
+[rfc9110]: https://www.rfc-editor.org/rfc/rfc9110
+[rfc9457]: https://www.rfc-editor.org/rfc/rfc9457
+[rfc9651]: https://www.rfc-editor.org/rfc/rfc9651
+[whatwg-url]: https://url.spec.whatwg.org/#application/x-www-form-urlencoded

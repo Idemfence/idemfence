@@ -10,6 +10,8 @@ one that took over.
 
 **Status: pre-release — no package published yet.**
 
+The behaviour idemfence will implement is specified in [docs/contract.md](docs/contract.md).
+
 ## License
 
 idemfence is licensed under the [Apache License, Version 2.0](LICENSE).
