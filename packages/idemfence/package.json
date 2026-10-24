@@ -1,0 +1,22 @@
+{
+  "name": "idemfence",
+  "version": "0.0.0",
+  "private": true,
+  "description": "HTTP idempotency-key middleware with fencing-token crash safety",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/idemfence/idemfence.git",
+    "directory": "packages/idemfence"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ]
+}
