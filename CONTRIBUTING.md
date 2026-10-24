@@ -36,6 +36,10 @@ fails the pull request if any commit is missing a matching sign-off. To fix the 
 recent commit, run `git commit --amend -s --no-edit`. For earlier commits, run
 `git rebase --signoff main`. Then force-push your branch.
 
+Keep your branch current with `git rebase --signoff`, not GitHub's "Update branch"
+button: the `dco` check also validates merge commits, and that button creates one
+without a sign-off.
+
 ## Definition of done
 
 A pull request is ready to merge only when all of the following hold:
