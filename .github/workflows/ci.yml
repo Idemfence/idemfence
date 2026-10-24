@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Weekly, so the audit catches new advisories against unchanged dependencies.
+  schedule:
+    - cron: "41 5 * * 1"
 
 permissions:
   contents: read
@@ -43,18 +46,65 @@ jobs:
       - name: Build
         run: pnpm build
 
+  licenses:
+    name: licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Check dependency licenses
+        run: node scripts/check-licenses.mjs
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit dependencies
+        run: pnpm audit --audit-level moderate
+
   ci:
     name: ci
     if: ${{ always() }}
-    needs: [check]
+    needs: [check, licenses, audit]
     runs-on: ubuntu-latest
     steps:
-      - name: Require every matrix job to succeed
+      - name: Require every job to succeed
         env:
-          CHECK_RESULT: ${{ needs.check.result }}
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          if [ "${CHECK_RESULT}" != "success" ]; then
-            echo "::error::Matrix jobs did not all succeed (result: ${CHECK_RESULT})."
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"' <<< "${NEEDS}")
+          if [ -n "${failed}" ]; then
+            echo "::error::Jobs did not all succeed: $(echo ${failed})"
             exit 1
           fi
-          echo "All matrix jobs succeeded."
+          echo "All jobs succeeded: $(jq -r 'keys | join(", ")' <<< "${NEEDS}")."
