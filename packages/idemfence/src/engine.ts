@@ -37,6 +37,8 @@ export type Handler = (
 ) => Promise<Response>;
 
 export interface Engine {
+  /** Verifies the store once (memoised on success); rejects with the store's error. */
+  ready(): Promise<void>;
   /**
    * Applies the contract to one request on a configured route. The route object is
    * validated on first use and cached by identity.
@@ -427,7 +429,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     }
   }
 
-  return { handle };
+  return { ready: ensureReady, handle };
 }
 
 /** Row 6: the stored response with the replay headers and a recomputed Content-Length. */

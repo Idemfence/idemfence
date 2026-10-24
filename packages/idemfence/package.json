@@ -18,6 +18,10 @@
     "./postgres": {
       "types": "./dist/stores/postgres/index.d.ts",
       "default": "./dist/stores/postgres/index.js"
+    },
+    "./fetch": {
+      "types": "./dist/fetch.d.ts",
+      "default": "./dist/fetch.js"
     }
   },
   "files": [
@@ -33,7 +37,9 @@
     }
   },
   "devDependencies": {
+    "@hono/node-server": "2.1.4",
     "@types/pg": "8.23.1",
+    "hono": "4.13.13",
     "pg": "8.23.1"
   }
 }

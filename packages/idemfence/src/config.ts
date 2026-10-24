@@ -27,6 +27,8 @@ import type { Store } from "./store.js";
  * - `ROUTE_TEMPLATE_INVALID`: a route's `routeTemplate` is not a string of 1 to 2048
  *   printable ASCII characters starting with `/`.
  * - `ROUTE_FLAG_INVALID`: a route's `allowSetCookieReplay` or `failOpen` is not a boolean.
+ * - `ROUTE_METHODS_INVALID`: a fetch route's `methods` is not a non-empty array of HTTP
+ *   method tokens.
  * - `WEBCRYPTO_MISSING`: `globalThis.crypto.subtle` is not available in this runtime.
  */
 export type IdemfenceConfigErrorCode =
@@ -46,6 +48,7 @@ export type IdemfenceConfigErrorCode =
   | "LOGGER_INVALID"
   | "ROUTE_TEMPLATE_INVALID"
   | "ROUTE_FLAG_INVALID"
+  | "ROUTE_METHODS_INVALID"
   | "WEBCRYPTO_MISSING";
 
 /** Thrown at construction when idemfence options are invalid. Messages never include secrets. */
