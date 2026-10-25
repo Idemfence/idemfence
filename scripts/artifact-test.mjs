@@ -124,6 +124,7 @@ try {
           "IdemfenceConfigError",
           "IdemfenceDeriveError",
           "IdemfenceFencedError",
+          "IdemfenceHoldLimitError",
           "IdemfenceStoreError",
           "createIdemfence",
         ],

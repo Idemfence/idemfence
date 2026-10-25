@@ -437,9 +437,10 @@ describe("rows 5 to 10: record state", () => {
       }
       return created('{"by":"A"}');
     };
+    // A stalled holder that does not renew: with the heartbeat on, its lease would not expire.
     const attemptA = shortLease.handle(
       req(key, { body: "{}" }),
-      ROUTE,
+      { routeTemplate: "/orders", heartbeat: false },
       handlerA,
     );
     await sleep(450);

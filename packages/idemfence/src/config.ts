@@ -9,9 +9,11 @@ import type { Store, TransactionalStore } from "./store.js";
  * - `SECRET_TOO_SHORT`: `secret` or an entry of `previousSecrets` is missing, not a string or
  *   `Uint8Array`, or shorter than 32 bytes (strings count UTF-8 bytes).
  * - `DOCS_URL_NOT_HTTPS`: `docsUrl` is missing, not a valid URL, or not `https:`.
- * - `DURATION_INVALID`: `retention`, `lease` or `storeUnavailableRetryAfter` is not a positive
- *   integer number of milliseconds or a string matching `/^\d+(ms|s|m|h|d)$/`.
+ * - `DURATION_INVALID`: `retention`, `lease`, `maxHold` or `storeUnavailableRetryAfter` is not
+ *   a positive integer number of milliseconds or a string matching `/^\d+(ms|s|m|h|d)$/`.
  * - `LEASE_NOT_SHORTER_THAN_RETENTION`: `lease` is greater than or equal to `retention`.
+ * - `MAX_HOLD_NOT_LONGER_THAN_LEASE`: `maxHold` is less than or equal to `lease`.
+ * - `MAX_HOLD_LONGER_THAN_RETENTION`: `maxHold` is greater than `retention`.
  * - `KEY_MAX_LENGTH_INVALID`: `keyMaxLength` is not an integer from 1 to 255.
  * - `KEY_SYNTAX_INVALID`: `keySyntax` is not `"sf-string"` or `"sf-string-or-raw"`.
  * - `BODY_CAP_INVALID`: `requestBodyCap` or `responseBodyCap` is not a positive integer.
@@ -26,7 +28,8 @@ import type { Store, TransactionalStore } from "./store.js";
  * - `LOGGER_INVALID`: `logger` is not an object with `warn` and `error` functions.
  * - `ROUTE_TEMPLATE_INVALID`: a route's `routeTemplate` is not a string of 1 to 2048
  *   printable ASCII characters starting with `/`.
- * - `ROUTE_FLAG_INVALID`: a route's `allowSetCookieReplay` or `failOpen` is not a boolean.
+ * - `ROUTE_FLAG_INVALID`: a route's `allowSetCookieReplay`, `failOpen` or `heartbeat` is not a
+ *   boolean.
  * - `ROUTE_METHODS_INVALID`: a fetch route's `methods` is not a non-empty array of HTTP
  *   method tokens.
  * - `WEBCRYPTO_MISSING`: `globalThis.crypto.subtle` is not available in this runtime.
@@ -46,6 +49,8 @@ export type IdemfenceConfigErrorCode =
   | "DOCS_URL_NOT_HTTPS"
   | "DURATION_INVALID"
   | "LEASE_NOT_SHORTER_THAN_RETENTION"
+  | "MAX_HOLD_NOT_LONGER_THAN_LEASE"
+  | "MAX_HOLD_LONGER_THAN_RETENTION"
   | "KEY_MAX_LENGTH_INVALID"
   | "KEY_SYNTAX_INVALID"
   | "BODY_CAP_INVALID"
@@ -126,6 +131,16 @@ export interface IdemfenceOptions<TRequest = unknown> {
   docsUrl: string;
   retention?: Duration;
   lease?: Duration;
+  /**
+   * The longest this process keeps a lease-mode lease alive, measured from acquisition on
+   * its own monotonic clock. When it is reached, the heartbeat stops, `ctx.signal` aborts
+   * with `IdemfenceHoldLimitError`, `ctx.renew()` rejects with it too, and the lease then
+   * expires on the store's clock, so a key is held at most `maxHold + lease`. Default
+   * `min(10 × lease, retention)`. It must be greater than `lease`
+   * (`MAX_HOLD_NOT_LONGER_THAN_LEASE`) and no greater than `retention`
+   * (`MAX_HOLD_LONGER_THAN_RETENTION`).
+   */
+  maxHold?: Duration;
   keyMaxLength?: number;
   /**
    * `"sf-string"` accepts only a Structured Field String. `"sf-string-or-raw"` also accepts an
@@ -153,6 +168,7 @@ export interface ResolvedConfig<TRequest = unknown> {
   readonly docsUrl: string;
   readonly retention: number;
   readonly lease: number;
+  readonly maxHold: number;
   readonly keyMaxLength: number;
   readonly keySyntax: KeySyntax;
   readonly requestBodyCap: number;
@@ -186,6 +202,12 @@ export interface RouteConfig {
   failOpen?: boolean;
   /** `"lease"` (default) or `"transactional"`; see {@link RouteMode}. */
   mode?: RouteMode;
+  /**
+   * Lease mode: renew the lease every `lease / 3` while the handler runs; default true. With
+   * false, the handler keeps its lease alive with `ctx.renew()`. Transactional mode has no
+   * lease and ignores it.
+   */
+  heartbeat?: boolean;
 }
 
 export interface ResolvedRoute {
@@ -201,6 +223,7 @@ export interface ResolvedRoute {
   readonly storeUnavailableRetryAfter: number;
   readonly allowSetCookieReplay: boolean;
   readonly failOpen: boolean;
+  readonly heartbeat: boolean;
 }
 
 // The package compiles against the ES2022 library only, so the runtime globals it needs
@@ -313,6 +336,24 @@ export function resolveConfig<TRequest>(
       "Option `lease` must be shorter than option `retention`.",
     );
   }
+  // The default never exceeds retention, so configurations that leave maxHold unset keep
+  // working however short their retention is.
+  const maxHold =
+    options.maxHold === undefined
+      ? Math.min(10 * lease, retention)
+      : parseDuration("maxHold", options.maxHold);
+  if (maxHold <= lease) {
+    throw new IdemfenceConfigError(
+      "MAX_HOLD_NOT_LONGER_THAN_LEASE",
+      "Option `maxHold` must be longer than option `lease`.",
+    );
+  }
+  if (maxHold > retention) {
+    throw new IdemfenceConfigError(
+      "MAX_HOLD_LONGER_THAN_RETENTION",
+      "Option `maxHold` must not be longer than option `retention`.",
+    );
+  }
 
   return Object.freeze({
     store: options.store,
@@ -326,6 +367,7 @@ export function resolveConfig<TRequest>(
     docsUrl: httpsUrl(options.docsUrl),
     retention,
     lease,
+    maxHold,
     keyMaxLength: keyMaxLength(options.keyMaxLength),
     keySyntax: keySyntax(options.keySyntax),
     requestBodyCap: bodyCap("requestBodyCap", options.requestBodyCap),
@@ -410,6 +452,12 @@ export function resolveRoute<TRequest>(
       "ROUTE_FLAG_INVALID",
       route.failOpen,
       false,
+    ),
+    heartbeat: booleanOption(
+      "heartbeat",
+      "ROUTE_FLAG_INVALID",
+      route.heartbeat,
+      true,
     ),
   };
   if (resolved.failOpen && resolved.mode === "transactional") {

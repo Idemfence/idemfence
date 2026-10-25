@@ -20,7 +20,10 @@ import type {
   TransactionalStore,
 } from "./store.js";
 
-/** Thrown by `ctx.renew()` when another attempt has taken the lease over (contract row 9). */
+/**
+ * Another attempt took the lease over (contract row 9): thrown by `ctx.renew()`, and the
+ * reason `ctx.signal` aborts with when a renewal (heartbeat or manual) is fenced.
+ */
 export class IdemfenceFencedError extends Error {
   readonly code = "FENCED";
 
@@ -29,6 +32,22 @@ export class IdemfenceFencedError extends Error {
       "Another attempt took over the lease for this request; its result will not be stored.",
     );
     this.name = "IdemfenceFencedError";
+  }
+}
+
+/**
+ * The handler held its lease for `maxHold`: the reason `ctx.signal` aborts with, and what
+ * `ctx.renew()` rejects with from then on. The lease is no longer renewed and expires on the
+ * store's clock.
+ */
+export class IdemfenceHoldLimitError extends Error {
+  readonly code = "HOLD_LIMIT";
+
+  constructor() {
+    super(
+      "The handler held its lease for maxHold; the lease is no longer renewed and will expire.",
+    );
+    this.name = "IdemfenceHoldLimitError";
   }
 }
 
@@ -71,12 +90,30 @@ export class IdemfenceDeriveError extends Error {
  */
 export type DeriveKey = (label: string) => Promise<string>;
 
+/**
+ * `ctx.signal`: aborts when this attempt has lost, or will lose, its lease, so the handler
+ * can stop downstream work (pass it to `fetch` and the like). It aborts only in lease mode
+ * while a lease is held: with {@link IdemfenceFencedError} when a renewal (heartbeat or
+ * `ctx.renew()`) finds that another attempt took the lease over, or with
+ * {@link IdemfenceHoldLimitError} once the lease has been held for `maxHold`. In
+ * transactional mode, on a fail-open run, and on a request idemfence does not apply to, it
+ * never aborts. It is not the request's signal and is not linked to it: a client that
+ * disconnects does not abort it (contract row 16). Aborting it interrupts nothing by itself.
+ */
+export type HandlerSignal = AbortSignal;
+
 /** The handler's context in lease mode (the default). */
 export interface LeaseHandlerContext {
-  /** Extends the lease; rejects with {@link IdemfenceFencedError} once fenced. */
+  /**
+   * Extends the lease. With the heartbeat on (the default) there is no need to call it.
+   * Rejects with {@link IdemfenceFencedError} once fenced (and aborts `signal` first), and
+   * with {@link IdemfenceHoldLimitError} once the lease has been held for `maxHold`.
+   */
   renew(): Promise<void>;
   /** See {@link DeriveKey}. */
   readonly deriveKey: DeriveKey;
+  /** See {@link HandlerSignal}. */
+  readonly signal: HandlerSignal;
   /** Absent in lease mode. */
   readonly tx?: undefined;
 }
@@ -112,6 +149,8 @@ export interface TransactionalHandlerContext {
   readonly tx: SqlExecutor;
   /** See {@link DeriveKey}. */
   readonly deriveKey: DeriveKey;
+  /** See {@link HandlerSignal}: there is no lease in this mode, so it never aborts. */
+  readonly signal: HandlerSignal;
 }
 
 export type HandlerContext = LeaseHandlerContext | TransactionalHandlerContext;
@@ -199,13 +238,24 @@ const deriveUnavailable: DeriveKey = async (label) => {
 };
 
 /**
+ * A signal for a context that holds no lease: nothing can abort it. One per request, so the
+ * listeners a handler adds (`fetch` adds one per call) never pile up on a shared signal.
+ */
+function quietSignal(): AbortSignal {
+  return new AbortController().signal;
+}
+
+/**
  * The lease-mode context for a request idemfence does not apply to (no key on an
  * optional-key route, or a method the adapter does not enforce).
  */
-const passthroughContext: LeaseHandlerContext = {
-  async renew() {},
-  deriveKey: deriveUnavailable,
-};
+function passthroughContext(): LeaseHandlerContext {
+  return {
+    async renew() {},
+    deriveKey: deriveUnavailable,
+    signal: quietSignal(),
+  };
+}
 
 // The row each non-acquired begin outcome answers, for logs.
 const NOT_ACQUIRED_ROWS = { replay: 6, mismatch: 7, in_flight: 8 } as const;
@@ -362,6 +412,8 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
         return handler(request, {
           async renew() {},
           deriveKey: deriveFor(key, printed.fingerprint),
+          // No lease is held, so nothing ever aborts it.
+          signal: quietSignal(),
         });
       }
       return storeUnavailable(
@@ -502,6 +554,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       response = await handler(request, {
         tx: transaction.executor,
         deriveKey: deriveFor(key, requestFingerprint),
+        signal: quietSignal(),
       });
     } catch (error) {
       return threw(error);
@@ -582,6 +635,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       response = await handler(request, {
         tx: transaction.executor,
         deriveKey: deriveUnavailable,
+        signal: quietSignal(),
       });
     } catch (error) {
       await rollback(transaction, undefined, 1);
@@ -620,6 +674,120 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     }
   }
 
+  /**
+   * Keeps a lease-mode lease while the handler runs (contract section 7). With the heartbeat
+   * on, renews every lease / 3 on the store's own connections, each renewal scheduled only
+   * after the previous one settled. A fenced renewal (heartbeat or manual) aborts `signal`
+   * with IdemfenceFencedError and stops the heartbeat; a failed one is retried at the next
+   * interval. After maxHold, on this process's monotonic clock, the heartbeat stops, `signal`
+   * aborts with IdemfenceHoldLimitError and `renew` refuses, so the lease expires on the
+   * store's clock and the key is held at most maxHold + lease. `settle()` stops everything
+   * and waits for a renewal in flight.
+   */
+  function holdLease(
+    key: Uint8Array,
+    fencingToken: bigint,
+    keyHash: string,
+    heartbeat: boolean,
+  ): {
+    signal: AbortSignal;
+    renew: () => Promise<void>;
+    settle: () => Promise<void>;
+  } {
+    const controller = new AbortController();
+    let stopped = false;
+    let holdLimitReached = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let inFlight: Promise<void> | undefined;
+
+    const stopHeartbeat = () => {
+      stopped = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+    const lost = (reason: Error) => {
+      stopHeartbeat();
+      if (!controller.signal.aborted) {
+        controller.abort(reason);
+      }
+    };
+
+    const beat = async () => {
+      try {
+        if ((await store.renew(key, fencingToken, config.lease)) === "fenced") {
+          logger.warn(
+            "idemfence: lease renewal was fenced; ctx.signal aborted",
+            { keyHash, row: 9, outcome: "fenced" },
+          );
+          lost(new IdemfenceFencedError());
+        }
+      } catch (error) {
+        logger.warn(
+          "idemfence: lease renewal failed; retrying at the next interval",
+          { keyHash, row: 9, outcome: "renew-failed", error: errorInfo(error) },
+        );
+      }
+    };
+    const schedule = () => {
+      if (stopped) {
+        return;
+      }
+      timer = setTimeout(
+        () => {
+          timer = undefined;
+          if (stopped) {
+            return;
+          }
+          inFlight = beat().finally(() => {
+            inFlight = undefined;
+            schedule();
+          });
+        },
+        Math.max(1, Math.floor(config.lease / 3)),
+      );
+      timer.unref();
+    };
+
+    const holdTimer = setTimeout(() => {
+      holdLimitReached = true;
+      if (controller.signal.aborted) {
+        return;
+      }
+      logger.warn(
+        "idemfence: lease held for maxHold; heartbeat stopped, ctx.signal aborted",
+        { keyHash, row: 9, outcome: "hold-limit" },
+      );
+      lost(new IdemfenceHoldLimitError());
+    }, config.maxHold);
+    holdTimer.unref();
+
+    if (heartbeat) {
+      schedule();
+    }
+
+    return {
+      signal: controller.signal,
+      async renew() {
+        if (holdLimitReached) {
+          throw new IdemfenceHoldLimitError();
+        }
+        if ((await store.renew(key, fencingToken, config.lease)) === "fenced") {
+          lost(new IdemfenceFencedError());
+          throw new IdemfenceFencedError();
+        }
+      },
+      async settle() {
+        stopHeartbeat();
+        clearTimeout(holdTimer);
+        while (inFlight !== undefined) {
+          await inFlight;
+        }
+      },
+    };
+  }
+
   async function run(
     request: Request,
     route: ResolvedRoute,
@@ -631,13 +799,11 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     deriveKey: DeriveKey,
   ): Promise<Response> {
     const row = attempts > 1 ? 9 : 5;
+    const lease = holdLease(key, fencingToken, keyHash, route.heartbeat);
     const ctx: LeaseHandlerContext = {
-      async renew() {
-        if ((await store.renew(key, fencingToken, config.lease)) === "fenced") {
-          throw new IdemfenceFencedError();
-        }
-      },
+      renew: lease.renew,
       deriveKey,
+      signal: lease.signal,
     };
 
     let outcome: HandlerOutcome;
@@ -646,6 +812,9 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     } catch (error) {
       outcome = { kind: "threw", error };
     }
+    // Before capture, complete or release: a renewal still running would see the completed
+    // row and report fenced for nothing, and no timer may outlive the request.
+    await lease.settle();
 
     let response: Response;
     const threw = outcome.kind === "threw";
@@ -854,7 +1023,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
   ): Promise<Response> {
     return mode === "transactional"
       ? plainTransaction(request, handler)
-      : handler(request, passthroughContext);
+      : handler(request, passthroughContext());
   }
 
   function passthrough(
@@ -865,7 +1034,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     // Only a transactional route needs resolving; a lease route passes straight through,
     // unvalidated, as it always has.
     if (routeConfig.mode !== "transactional") {
-      return handler(request, passthroughContext);
+      return handler(request, passthroughContext());
     }
     return unapplied(request, resolved(routeConfig).mode, handler);
   }
