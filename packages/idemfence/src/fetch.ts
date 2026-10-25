@@ -1,9 +1,5 @@
 import { IdemfenceConfigError, type RouteConfig } from "./config.js";
-import {
-  type Handler,
-  isBodyTooLargeResponse,
-  passthroughContext,
-} from "./engine.js";
+import { type Handler, isBodyTooLargeResponse } from "./engine.js";
 import type { Idemfence } from "./index.js";
 
 export type {
@@ -19,8 +15,9 @@ export type { Idemfence } from "./index.js";
 export interface FetchRouteConfig extends RouteConfig {
   /**
    * Methods the key is enforced on, compared case-sensitively (methods are case-sensitive).
-   * Requests with any other method pass straight to the handler (contract row 1).
-   * Default `["POST", "PATCH"]`.
+   * Requests with any other method pass to the handler without idemfence (contract row 1):
+   * on a `mode: "transactional"` route still inside a plain transaction with `ctx.tx` and
+   * no record, as for a request without a key. Default `["POST", "PATCH"]`.
    */
   methods?: readonly string[];
 }
@@ -45,7 +42,7 @@ export function idempotent(
 
   return async (request) => {
     if (!methods.has(request.method)) {
-      return handler(request, passthroughContext);
+      return idem.passthrough(request, engineRoute, handler);
     }
     const response = await idem.handle(request, engineRoute, handler);
     // Row 15: close the connection rather than read the rest of the upload. Only the

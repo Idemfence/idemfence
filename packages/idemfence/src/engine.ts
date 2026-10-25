@@ -133,6 +133,12 @@ export interface Engine {
     route: RouteConfig,
     handler: Handler,
   ): Promise<Response>;
+  /** See `Idemfence.passthrough`. */
+  passthrough(
+    request: Request,
+    route: RouteConfig,
+    handler: Handler,
+  ): Promise<Response>;
 }
 
 const COMPLETE_ATTEMPTS = 3;
@@ -196,7 +202,7 @@ const deriveUnavailable: DeriveKey = async (label) => {
  * The lease-mode context for a request idemfence does not apply to (no key on an
  * optional-key route, or a method the adapter does not enforce).
  */
-export const passthroughContext: LeaseHandlerContext = {
+const passthroughContext: LeaseHandlerContext = {
   async renew() {},
   deriveKey: deriveUnavailable,
 };
@@ -279,9 +285,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     // Optional-key route without a key: handled as row 1. A transactional handler still
     // gets ctx.tx, in a transaction with no record.
     if (parsed.key === undefined) {
-      return route.mode === "transactional"
-        ? plainTransaction(request, handler)
-        : handler(request, passthroughContext);
+      return unapplied(request, route.mode, handler);
     }
 
     // Row 4, fail closed: a scope that throws, or returns anything but a non-empty
@@ -838,7 +842,35 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     }
   }
 
-  return { ready: ensureReady, handle };
+  /**
+   * A request idemfence does not apply to (row 1): no key on an optional-key route, or a
+   * method the adapter does not enforce. A transactional handler still gets ctx.tx, in a
+   * plain transaction with no record; a lease handler gets the passthrough context.
+   */
+  function unapplied(
+    request: Request,
+    mode: ResolvedRoute["mode"],
+    handler: Handler,
+  ): Promise<Response> {
+    return mode === "transactional"
+      ? plainTransaction(request, handler)
+      : handler(request, passthroughContext);
+  }
+
+  function passthrough(
+    request: Request,
+    routeConfig: RouteConfig,
+    handler: Handler,
+  ): Promise<Response> {
+    // Only a transactional route needs resolving; a lease route passes straight through,
+    // unvalidated, as it always has.
+    if (routeConfig.mode !== "transactional") {
+      return handler(request, passthroughContext);
+    }
+    return unapplied(request, resolved(routeConfig).mode, handler);
+  }
+
+  return { ready: ensureReady, handle, passthrough };
 }
 
 /** Row 6: the stored response with the replay headers and a recomputed Content-Length. */

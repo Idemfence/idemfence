@@ -65,6 +65,20 @@ export interface Idemfence {
     route: RouteConfig,
     handler: Handler,
   ): Promise<Response>;
+  /**
+   * Runs `handler` for a request on a configured route that idemfence does not apply to,
+   * such as a method the adapter does not enforce (contract row 1). Adapters call this
+   * instead of calling the handler directly. On a `mode: "transactional"` route the handler
+   * runs in a plain transaction with `ctx.tx` and no record (committed when it resolves,
+   * rolled back and rethrown when it throws), as for a request without a key. On a lease
+   * route it gets a context whose `renew` does nothing. Either way `ctx.deriveKey` rejects
+   * with `DERIVE_KEY_UNAVAILABLE`.
+   */
+  passthrough(
+    request: Request,
+    route: RouteConfig,
+    handler: Handler,
+  ): Promise<Response>;
 }
 
 /** Validates `options` (throwing `IdemfenceConfigError`) and returns an instance. */
@@ -73,5 +87,7 @@ export function createIdemfence(options: IdemfenceOptions<Request>): Idemfence {
   return {
     ready: () => engine.ready(),
     handle: (request, route, handler) => engine.handle(request, route, handler),
+    passthrough: (request, route, handler) =>
+      engine.passthrough(request, route, handler),
   };
 }
