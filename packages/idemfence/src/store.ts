@@ -13,6 +13,9 @@
  *   error, the `cause` is the server's error (SQLSTATE in `cause.code`).
  * - `COMMIT_UNKNOWN`: the connection failed during `COMMIT` with no answer from the server,
  *   so the transaction may or may not have committed. The `cause` is the driver's error.
+ * - `TRANSACTION_ENDED`: a query was sent on a transaction's executor (such as `ctx.tx`)
+ *   after that transaction committed or rolled back. The query never reached the
+ *   connection, which may already serve another caller.
  */
 export type IdemfenceStoreErrorCode =
   | "SCHEMA_VERSION_MISMATCH"
@@ -20,7 +23,8 @@ export type IdemfenceStoreErrorCode =
   | "BEGIN_RACE_EXHAUSTED"
   | "TRANSACTION_UNAVAILABLE"
   | "COMMIT_REJECTED"
-  | "COMMIT_UNKNOWN";
+  | "COMMIT_UNKNOWN"
+  | "TRANSACTION_ENDED";
 
 /** Thrown by a store for conditions that are not a normal `begin` outcome. */
 export class IdemfenceStoreError extends Error {
@@ -59,7 +63,11 @@ export type BeginResult =
   | { readonly outcome: "replay"; readonly response: StoredResponse }
   /** The key exists with a different fingerprint, completed or in flight (row 7). */
   | { readonly outcome: "mismatch" }
-  /** The key is in flight under a valid lease with the same fingerprint (row 8). */
+  /**
+   * The key is in flight with the same fingerprint (row 8): under a valid lease, with
+   * `retryAfterMs` the remaining lease, or, for a `begin` given an executor, held by another
+   * uncommitted transaction past the lock timeout, with `retryAfterMs` the lock timeout.
+   */
   | { readonly outcome: "in_flight"; readonly retryAfterMs: number };
 
 /** The part of a query result idemfence reads. */
@@ -76,7 +84,7 @@ export interface SqlResult<R> {
  * transaction. A `pg` `Pool` and `PoolClient` satisfy it as they are; another driver plugs
  * in by implementing `query`. In transactional mode the handler receives the transaction's
  * executor as `ctx.tx`, and a store that supports the mode accepts an executor on each
- * operation so the record is written inside the caller's transaction.
+ * operation so the record is written inside that same transaction.
  */
 export interface SqlExecutor {
   query<R extends object = Record<string, unknown>>(
@@ -118,22 +126,55 @@ export interface Store {
 }
 
 /**
- * A store that can also run the handler inside one of its transactions (transactional mode,
- * docs/contract.md section 7). `transaction` commits when `fn` resolves, rolls back when it
- * rejects (rethrowing `fn`'s rejection unchanged), and holds one connection for the whole
- * call. Its own failures are `IdemfenceStoreError`s: `TRANSACTION_UNAVAILABLE`,
- * `COMMIT_REJECTED` or `COMMIT_UNKNOWN`.
+ * One open transaction on one connection, from {@link TransactionalStore.openTransaction}.
+ * Exactly one of `commit` or `rollback` ends it and gives the connection back; after that,
+ * every query on `executor` rejects with `TRANSACTION_ENDED` without reaching the connection.
+ */
+export interface StoreTransaction {
+  /** Runs queries inside the transaction (the handler's `ctx.tx` in transactional mode). */
+  readonly executor: SqlExecutor;
+  /**
+   * `COMMIT`. Rejects with `COMMIT_REJECTED` (rolled back for certain, including a
+   * transaction that a failed statement had already aborted) or `COMMIT_UNKNOWN` (the
+   * connection failed during `COMMIT`; it may have committed).
+   */
+  commit(): Promise<void>;
+  /**
+   * `ROLLBACK`. Rejects with the driver's error when `ROLLBACK` itself failed; the connection
+   * is then destroyed instead of returned, and nothing was committed either way.
+   */
+  rollback(): Promise<void>;
+}
+
+/**
+ * A store that can also write the record inside the handler's own transaction
+ * (transactional mode, docs/contract.md section 7).
  */
 export interface TransactionalStore extends Store {
-  /** The `lock_timeout` applied to each transaction, in milliseconds. */
+  /**
+   * How long `begin` given an executor waits for another transaction that holds the same
+   * key, in milliseconds.
+   */
   readonly lockTimeoutMs: number;
-  transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T>;
+  /**
+   * `BEGIN` on one connection of the store's own, held until the transaction ends. Rejects
+   * with `TRANSACTION_UNAVAILABLE` when no connection could be taken or `BEGIN` failed.
+   */
+  openTransaction(): Promise<StoreTransaction>;
   /**
    * Every operation also takes an optional executor; given one, it runs on it (inside the
-   * caller's transaction) instead of on the store's own connections. Inside `transaction`,
-   * an operation MUST be given its executor: taking a second connection while holding one
-   * would deadlock a saturated pool. `renew` has no place inside a transaction: the update
-   * would be invisible to other sessions until commit and would row-lock the record.
+   * caller's transaction) instead of on the store's own connections. While a transaction is
+   * open, an operation MUST be given its executor: taking a second connection while holding
+   * one would deadlock a saturated pool. `renew` has no place inside a transaction: the
+   * update would be invisible to other sessions until commit and would row-lock the record.
+   *
+   * Given an executor, `begin` waits at most `lockTimeoutMs` for another transaction that
+   * holds the same key and then resolves `in_flight` with `retryAfterMs` set to
+   * `lockTimeoutMs`. A serialization failure (SQLSTATE 40001, under REPEATABLE READ or
+   * SERIALIZABLE when the holder commits during the wait) resolves the same way, since a
+   * retry sees the committed record. After either, the caller's transaction is aborted and
+   * must be rolled back. Otherwise `begin` restores the `lock_timeout` that was in effect
+   * before it ran, so the caller's later statements run with their normal setting.
    */
   begin(
     lookupKey: Uint8Array,

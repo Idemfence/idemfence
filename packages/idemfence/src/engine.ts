@@ -12,11 +12,12 @@ import {
   type ProblemKind,
   problemResponse,
 } from "./problem.js";
-import {
-  IdemfenceStoreError,
-  type SqlExecutor,
-  type StoredResponse,
-  type TransactionalStore,
+import type {
+  BeginResult,
+  SqlExecutor,
+  StoredResponse,
+  StoreTransaction,
+  TransactionalStore,
 } from "./store.js";
 
 /** Thrown by `ctx.renew()` when another attempt has taken the lease over (contract row 9). */
@@ -48,8 +49,23 @@ export interface TransactionalHandlerContext {
   /** Absent in transactional mode. */
   readonly renew?: undefined;
   /**
-   * The handler's transaction: every query on it commits when the handler returns and
-   * rolls back when it throws.
+   * The handler's transaction, which also holds the idempotency record (docs/contract.md
+   * section 7). What the handler writes through it commits together with the stored
+   * response, and rolls back together with the record when the handler throws (row 13) or
+   * returns a release status (row 11). On a request without a key (optional-key route) it
+   * is a plain transaction with no record: committed when the handler resolves, rolled back
+   * when it throws.
+   *
+   * - Never run `BEGIN`, `COMMIT` or `ROLLBACK` on it: idemfence ends the transaction after
+   *   storing the response. `SAVEPOINT`, `RELEASE SAVEPOINT` and `ROLLBACK TO SAVEPOINT`
+   *   are fine.
+   * - A failed statement aborts the whole transaction, even when the handler catches the
+   *   error; the request is then answered 503 store-unavailable and nothing is committed.
+   *   Use a savepoint around a statement that may fail.
+   * - It is dead once the transaction ends: a query after the handler's response has been
+   *   committed or rolled back rejects at once with `IdemfenceStoreError` code
+   *   `TRANSACTION_ENDED`. A response body over `responseBodyCap` is streamed to the client
+   *   after `COMMIT`, so it must not read from `ctx.tx`.
    */
   readonly tx: SqlExecutor;
 }
@@ -107,13 +123,14 @@ export function isBodyTooLargeResponse(response: Response): boolean {
 
 type HandlerOutcome =
   | { kind: "response"; response: Response }
-  | { kind: "threw"; error: unknown }
-  /** Transactional mode only: the transaction could not be opened or committed. */
-  | { kind: "unavailable"; error: unknown };
+  | { kind: "threw"; error: unknown };
 
 const passthroughContext: LeaseHandlerContext = {
   async renew() {},
 };
+
+// The row each non-acquired begin outcome answers, for logs.
+const NOT_ACQUIRED_ROWS = { replay: 6, mismatch: 7, in_flight: 8 } as const;
 
 export function createEngine(config: ResolvedConfig<Request>): Engine {
   const { store, logger } = config;
@@ -165,9 +182,12 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     if ("error" in parsed) {
       return problem(route, parsed.error);
     }
-    // Optional-key route without a key: handled as row 1.
+    // Optional-key route without a key: handled as row 1. A transactional handler still
+    // gets ctx.tx, in a transaction with no record.
     if (parsed.key === undefined) {
-      return handler(request, passthroughContext);
+      return route.mode === "transactional"
+        ? plainTransaction(request, handler)
+        : handler(request, passthroughContext);
     }
 
     // Row 4, fail closed: a scope that throws, or returns anything but a non-empty
@@ -208,8 +228,19 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     });
     const keyHash = hashPrefix(key);
 
+    if (route.mode === "transactional") {
+      return transactional(
+        request,
+        route,
+        handler,
+        key,
+        printed.fingerprint,
+        keyHash,
+      );
+    }
+
     // Row 14.
-    let begun: Awaited<ReturnType<typeof store.begin>>;
+    let begun: BeginResult;
     try {
       await ensureReady();
       begun = await store.begin(
@@ -231,15 +262,33 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
         );
         return handler(request, passthroughContext);
       }
-      logger.error("idemfence: store unavailable", {
+      return storeUnavailable(
+        route,
         keyHash,
-        row: 14,
-        outcome: "store-unavailable",
-        error: errorInfo(error),
-      });
-      return problem(route, "store-unavailable");
+        "idemfence: store unavailable",
+        error,
+      );
     }
 
+    if (begun.outcome !== "acquired") {
+      return notAcquired(route, begun);
+    }
+    return run(
+      request,
+      route,
+      handler,
+      key,
+      keyHash,
+      begun.fencingToken,
+      begun.attempts,
+    );
+  }
+
+  /** Rows 6, 7 and 8: the response for a key this request could not claim. */
+  function notAcquired(
+    route: ResolvedRoute,
+    begun: Exclude<BeginResult, { outcome: "acquired" }>,
+  ): Response {
     switch (begun.outcome) {
       case "replay":
         return replay(begun.response);
@@ -254,16 +303,202 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
           },
           { retryAfterMs: begun.retryAfterMs },
         );
-      case "acquired":
-        return run(
-          request,
-          route,
-          handler,
-          key,
+    }
+  }
+
+  /** Row 14 and the transactional-mode 503 of section 5: logged, fail closed. */
+  function storeUnavailable(
+    route: ResolvedRoute,
+    keyHash: string,
+    message: string,
+    error: unknown,
+  ): Response {
+    logger.error(message, {
+      keyHash,
+      row: 14,
+      outcome: "store-unavailable",
+      error: errorInfo(error),
+    });
+    return problem(route, "store-unavailable");
+  }
+
+  /**
+   * Transactional mode (contract section 7). One transaction on one connection holds the
+   * record and the handler's writes, so they commit or roll back together, and the response
+   * is sent only once COMMIT has succeeded. While it is open no second connection is taken:
+   * on a saturated pool that would deadlock. There is no renew: the transaction is the lease.
+   */
+  async function transactional(
+    request: Request,
+    route: ResolvedRoute,
+    handler: Handler,
+    key: Uint8Array,
+    requestFingerprint: Uint8Array,
+    keyHash: string,
+  ): Promise<Response> {
+    const txStore = store as TransactionalStore;
+
+    // Row 14.
+    let transaction: StoreTransaction;
+    try {
+      await ensureReady();
+      transaction = await txStore.openTransaction();
+    } catch (error) {
+      return storeUnavailable(
+        route,
+        keyHash,
+        "idemfence: store unavailable",
+        error,
+      );
+    }
+    let begun: BeginResult;
+    try {
+      // A concurrent request holding the key makes begin wait, up to the store's lock
+      // timeout, on its uncommitted record.
+      begun = await txStore.begin(
+        key,
+        requestFingerprint,
+        config.lease,
+        config.retention,
+        transaction.executor,
+      );
+    } catch (error) {
+      await rollback(transaction, keyHash, 14);
+      return storeUnavailable(
+        route,
+        keyHash,
+        "idemfence: store unavailable",
+        error,
+      );
+    }
+    if (begun.outcome !== "acquired") {
+      // Nothing was written (and a lock timeout left the transaction aborted).
+      await rollback(transaction, keyHash, NOT_ACQUIRED_ROWS[begun.outcome]);
+      return notAcquired(route, begun);
+    }
+
+    let response: Response;
+    try {
+      response = await handler(request, { tx: transaction.executor });
+    } catch (error) {
+      // Row 13: the record rolls back with the handler's writes, so the key is free and a
+      // retry runs the handler again.
+      await rollback(transaction, keyHash, 13);
+      logger.error(
+        "idemfence: handler threw; its writes and the record were rolled back, nothing stored",
+        {
           keyHash,
-          begun.fencingToken,
-          begun.attempts,
-        );
+          row: 13,
+          outcome: "handler-error",
+          error: errorInfo(error),
+        },
+      );
+      return internalProblemResponse();
+    }
+
+    // Row 11: the handler's writes and the record roll back together; the key is free.
+    if (route.releaseStatuses.includes(response.status)) {
+      await rollback(transaction, keyHash, 11);
+      return response;
+    }
+
+    // Rows 5, 10 and 12: store-then-send, with the record completed inside the transaction.
+    let captured: Awaited<ReturnType<typeof capture>>;
+    try {
+      captured = await capture(response, route, keyHash);
+    } catch (error) {
+      await rollback(transaction, keyHash, 12);
+      throw error;
+    }
+    let completed: "completed" | "fenced";
+    try {
+      // Once, without retries: a failed statement aborts the transaction.
+      completed = await txStore.complete(
+        key,
+        begun.fencingToken,
+        captured.stored,
+        transaction.executor,
+      );
+    } catch (error) {
+      // Also the path for a transaction the handler left aborted (it caught a failed
+      // statement). None of the handler's work was committed, so its response is not sent.
+      cancelBody(captured.send);
+      await rollback(transaction, keyHash, 14);
+      return storeUnavailable(
+        route,
+        keyHash,
+        "idemfence: the record could not be completed in the handler's transaction; rolled back",
+        error,
+      );
+    }
+    if (completed === "fenced") {
+      cancelBody(captured.send);
+      await rollback(transaction, keyHash, 14);
+      logger.error(
+        "idemfence: invariant violated: complete was fenced inside the transaction that holds the record's row lock; rolled back",
+        { keyHash, row: 14, outcome: "fenced" },
+      );
+      return problem(route, "store-unavailable");
+    }
+    try {
+      await transaction.commit();
+    } catch (error) {
+      // COMMIT_REJECTED rolled everything back. After COMMIT_UNKNOWN the record and the
+      // handler's writes either both landed (a retry replays) or neither did (a retry runs
+      // the handler); there is nothing to release either way.
+      cancelBody(captured.send);
+      return storeUnavailable(
+        route,
+        keyHash,
+        "idemfence: COMMIT of the handler's transaction failed",
+        error,
+      );
+    }
+    return captured.send;
+  }
+
+  /**
+   * An optional-key transactional route without a key (row 1): the handler runs in a plain
+   * transaction with no record, committed when it resolves and rolled back when it throws.
+   * Failures to open or commit reject, as the handler's own database errors would.
+   */
+  async function plainTransaction(
+    request: Request,
+    handler: Handler,
+  ): Promise<Response> {
+    const transaction = await (store as TransactionalStore).openTransaction();
+    let response: Response;
+    try {
+      response = await handler(request, { tx: transaction.executor });
+    } catch (error) {
+      await rollback(transaction, undefined, 1);
+      throw error;
+    }
+    await transaction.commit();
+    return response;
+  }
+
+  /**
+   * Ends a transaction that must not commit. A failed ROLLBACK destroys the connection,
+   * which commits nothing either, so it only logs and never changes the response.
+   */
+  async function rollback(
+    transaction: StoreTransaction,
+    keyHash: string | undefined,
+    row: number,
+  ): Promise<void> {
+    try {
+      await transaction.rollback();
+    } catch (error) {
+      logger.error(
+        "idemfence: ROLLBACK failed; the connection was destroyed and nothing was committed",
+        {
+          ...(keyHash === undefined ? {} : { keyHash }),
+          row,
+          outcome: "rollback-failed",
+          error: errorInfo(error),
+        },
+      );
     }
   }
 
@@ -286,52 +521,10 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     };
 
     let outcome: HandlerOutcome;
-    if (route.mode === "transactional") {
-      // The handler runs inside one store transaction and sees it as ctx.tx; a throw rolls
-      // its writes back. Writing the record inside that transaction (contract rows 11 and
-      // 13) is not implemented yet: the record still follows lease mode.
-      // No renew here: the transaction is the lease, and the engine takes no second
-      // connection while the handler holds this one (a saturated pool would deadlock).
-      outcome = await inTransaction(request, handler, (tx) => ({ tx }));
-      if (outcome.kind === "unavailable") {
-        // Row 14, both ways a 503 with Retry-After rather than a stored 500, which would be
-        // replayed for an operation that never ran.
-        if (isCommitUnknown(outcome.error)) {
-          // The connection failed during COMMIT with no answer from the server: the
-          // handler's writes may or may not have landed. The lease is kept so a retry
-          // waits (row 8) until it expires; the record lives outside the transaction until
-          // 2.2 moves it inside, which resolves this ambiguity.
-          logger.error(
-            "idemfence: connection failed during COMMIT; outcome unknown, lease kept",
-            {
-              keyHash,
-              row: 14,
-              outcome: "commit-unknown",
-              error: errorInfo(outcome.error),
-            },
-          );
-          return problem(route, "store-unavailable");
-        }
-        // The transaction could not be opened, or the server rejected COMMIT: the
-        // handler's work never happened, so the key is freed for a retry.
-        logger.error(
-          "idemfence: transaction could not be opened or committed; nothing was applied",
-          {
-            keyHash,
-            row: 14,
-            outcome: "store-unavailable",
-            error: errorInfo(outcome.error),
-          },
-        );
-        await releaseLease(key, fencingToken, keyHash, 14);
-        return problem(route, "store-unavailable");
-      }
-    } else {
-      try {
-        outcome = { kind: "response", response: await handler(request, ctx) };
-      } catch (error) {
-        outcome = { kind: "threw", error };
-      }
+    try {
+      outcome = { kind: "response", response: await handler(request, ctx) };
+    } catch (error) {
+      outcome = { kind: "threw", error };
     }
 
     let response: Response;
@@ -376,36 +569,6 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       );
     }
     return captured.send;
-  }
-
-  /**
-   * Runs the handler inside the store's transaction. The handler's own throw is recorded
-   * before it propagates, so anything else escaping `transaction()` is the store failing to
-   * open or commit it.
-   */
-  async function inTransaction(
-    request: Request,
-    handler: Handler,
-    context: (tx: SqlExecutor) => HandlerContext,
-  ): Promise<HandlerOutcome> {
-    let threw: { error: unknown } | undefined;
-    try {
-      const response = await (store as TransactionalStore).transaction(
-        async (tx) => {
-          try {
-            return await handler(request, context(tx));
-          } catch (error) {
-            threw = { error };
-            throw error;
-          }
-        },
-      );
-      return { kind: "response", response };
-    } catch (error) {
-      return threw === undefined
-        ? { kind: "unavailable", error }
-        : { kind: "threw", error: threw.error };
-    }
   }
 
   /** Deletes the in-flight record so the key can be retried; a failure only logs. */
@@ -620,10 +783,12 @@ function concat(
   return body;
 }
 
-function isCommitUnknown(error: unknown): boolean {
-  return (
-    error instanceof IdemfenceStoreError && error.code === "COMMIT_UNKNOWN"
-  );
+/**
+ * Releases a response body that will not be sent; over the cap that is the rest of the
+ * handler's own stream.
+ */
+function cancelBody(response: Response): void {
+  response.body?.cancel().catch(() => undefined);
 }
 
 function hashPrefix(key: Uint8Array): string {

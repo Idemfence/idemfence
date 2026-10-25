@@ -27,6 +27,7 @@ export {
   type SqlResult,
   type Store,
   type StoredResponse,
+  type StoreTransaction,
   type TransactionalStore,
 } from "./store.js";
 export type {
