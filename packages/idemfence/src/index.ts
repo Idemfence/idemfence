@@ -7,6 +7,7 @@ import {
   type LogFields,
   type Logger,
   type RouteConfig,
+  type RouteMode,
   resolveConfig,
 } from "./config.js";
 import {
@@ -20,8 +21,11 @@ export {
   type BeginResult,
   IdemfenceStoreError,
   type IdemfenceStoreErrorCode,
+  type SqlExecutor,
+  type SqlResult,
   type Store,
   type StoredResponse,
+  type TransactionalStore,
 } from "./store.js";
 export type {
   Duration,
@@ -33,6 +37,7 @@ export type {
   LogFields,
   Logger,
   RouteConfig,
+  RouteMode,
 };
 export { IdemfenceConfigError, IdemfenceFencedError };
 

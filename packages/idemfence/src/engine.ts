@@ -12,7 +12,11 @@ import {
   type ProblemKind,
   problemResponse,
 } from "./problem.js";
-import type { StoredResponse } from "./store.js";
+import type {
+  SqlExecutor,
+  StoredResponse,
+  TransactionalStore,
+} from "./store.js";
 
 /** Thrown by `ctx.renew()` when another attempt has taken the lease over (contract row 9). */
 export class IdemfenceFencedError extends Error {
@@ -29,6 +33,11 @@ export class IdemfenceFencedError extends Error {
 export interface HandlerContext {
   /** Extends the lease; rejects with {@link IdemfenceFencedError} once fenced. */
   renew(): Promise<void>;
+  /**
+   * In a route with `mode: "transactional"`, the handler's transaction: every query on it
+   * commits when the handler returns and rolls back when it throws. Absent in lease mode.
+   */
+  readonly tx?: SqlExecutor;
 }
 
 export type Handler = (
@@ -257,7 +266,15 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     let response: Response;
     let threw = false;
     try {
-      response = await handler(request, ctx);
+      // Transactional mode: the handler runs inside one store transaction and sees it as
+      // ctx.tx; a throw rolls its writes back. Writing the record inside that transaction
+      // (contract rows 11 and 13) is not implemented yet: the record still follows lease mode.
+      response =
+        route.mode === "transactional"
+          ? await (store as TransactionalStore).transaction((tx) =>
+              handler(request, { ...ctx, tx }),
+            )
+          : await handler(request, ctx);
     } catch (error) {
       threw = true;
       // Row 12: side effects may have happened, so the failure is stored and replayed.

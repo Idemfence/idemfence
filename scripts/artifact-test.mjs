@@ -42,6 +42,7 @@ const EXPECTED_FILES = [
     "problem",
     "store",
     "stores/postgres/index",
+    "stores/postgres/transaction",
   ].flatMap((m) => [`dist/${m}.d.ts`, `dist/${m}.js`, `dist/${m}.js.map`]),
 ].sort();
 
@@ -126,7 +127,7 @@ try {
           "createIdemfence",
         ],
         fetch: ["idempotent"],
-        postgres: ["IdemfenceStoreError", "postgresStore"],
+        postgres: ["IdemfenceStoreError", "postgresStore", "withTransaction"],
         sqlHasRecords: true,
       }),
     `ESM: idemfence, idemfence/fetch, idemfence/postgres and the migration SQL resolve (${JSON.stringify(esmOut)})`,

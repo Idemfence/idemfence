@@ -28,12 +28,53 @@ Node 22.13 or later. The Postgres store (`idemfence/postgres`) uses your own
 - `idemfence/fetch`: `idempotent(idem, route, handler)` wraps a Web-standard
   `(request: Request) => Promise<Response>` handler; it depends on no framework and is tested
   on Hono over HTTP/1.1 and HTTP/2.
-- `idemfence/postgres`: `postgresStore({ pool, schema? })`, lease mode on PostgreSQL. The
-  schema ships as `idemfence/postgres/migrations/001_init.sql`.
+- `idemfence/postgres`: `postgresStore({ pool, schema?, lockTimeout? })` on PostgreSQL. The
+  schema ships as `idemfence/postgres/migrations/001_init.sql`. It also exports
+  `withTransaction(pool, { lockTimeout? }, fn)`, which runs `fn` on one pooled client inside
+  `BEGIN` / `SET LOCAL lock_timeout` / `COMMIT`, rolling back when `fn` throws.
 - `idemfence-conformance` (in this repository): a black-box suite that checks a running
   service against the contract, row by row, plus a concurrency group.
 
-Transactional mode, Redis, and the Express and Fastify adapters are not released yet.
+Redis and the Express and Fastify adapters are not released yet.
+
+## Transactional mode
+
+A route with `mode: "transactional"` runs its handler inside one of the store's
+transactions and passes it to the handler as `ctx.tx`, a `SqlExecutor`
+(`query(text, params)`, the interface a `pg` `Pool` or `PoolClient` already satisfies).
+Everything the handler writes through `ctx.tx` commits when the handler returns and rolls
+back when it throws. In lease mode `ctx.tx` is absent.
+
+```ts
+import { createIdemfence } from "idemfence";
+import { idempotent } from "idemfence/fetch";
+import { postgresStore } from "idemfence/postgres";
+
+const store = postgresStore({ pool, lockTimeout: "250ms" });
+const idem = createIdemfence({ store, scope, secret, docsUrl });
+
+const createOrder = idempotent(
+  idem,
+  { routeTemplate: "/orders", mode: "transactional" },
+  async (request, ctx) => {
+    await ctx.tx?.query("INSERT INTO orders (id) VALUES ($1)", [orderId]);
+    return Response.json({ id: orderId }, { status: 201 });
+  },
+);
+```
+
+The transaction holds one pool connection for the handler's whole duration, so size the
+pool for the number of transactional handlers that may run at once, and set
+[`idle_in_transaction_session_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT)
+on the server so a stalled handler cannot hold a connection open indefinitely. The
+transaction's `lock_timeout` (default 250 ms, `lockTimeout` on the store) bounds how long a
+statement waits for a row lock; an invalid value throws `IdemfenceConfigError` with code
+`LOCK_TIMEOUT_INVALID`. Writing the idempotency record inside the handler's transaction, so
+that the record and the handler's writes commit or roll back together (contract rows 11 and
+13), is the next step; until then the record follows lease mode.
+
+Another SQL driver can be used in place of `pg` by implementing `SqlExecutor` and a store
+that accepts it; only the Postgres store ships today.
 
 ## TypeScript
 

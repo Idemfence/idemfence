@@ -1,24 +1,68 @@
 import type { Pool } from "pg";
+import { type Duration, lockTimeoutMs } from "../../config.js";
 import {
   type BeginResult,
   IdemfenceStoreError,
-  type Store,
+  type SqlExecutor,
   type StoredResponse,
+  type TransactionalStore,
 } from "../../store.js";
+import { withTransaction } from "./transaction.js";
 
 export {
   type BeginResult,
   IdemfenceStoreError,
   type IdemfenceStoreErrorCode,
+  type SqlExecutor,
+  type SqlResult,
   type Store,
   type StoredResponse,
+  type TransactionalStore,
 } from "../../store.js";
+export { type TransactionOptions, withTransaction } from "./transaction.js";
 
 export interface PostgresStoreOptions {
   /** The caller's pool. The store never creates connections or reads environment variables. */
   pool: Pool;
   /** Schema holding the idemfence tables; default `public`. */
   schema?: string;
+  /**
+   * `lock_timeout` for the transactions this store opens (transactional mode); default
+   * `"250ms"`. Invalid values throw `IdemfenceConfigError` with code `LOCK_TIMEOUT_INVALID`.
+   */
+  lockTimeout?: Duration;
+}
+
+/**
+ * The Postgres store. Every operation takes an optional executor; given one, the operation
+ * runs on it (inside the caller's transaction) instead of on the pool.
+ */
+export interface PostgresStore extends TransactionalStore {
+  begin(
+    lookupKey: Uint8Array,
+    fingerprint: Uint8Array,
+    leaseMs: number,
+    retentionMs: number,
+    executor?: SqlExecutor,
+  ): Promise<BeginResult>;
+  renew(
+    lookupKey: Uint8Array,
+    fencingToken: bigint,
+    leaseMs: number,
+    executor?: SqlExecutor,
+  ): Promise<"renewed" | "fenced">;
+  complete(
+    lookupKey: Uint8Array,
+    fencingToken: bigint,
+    response: StoredResponse,
+    executor?: SqlExecutor,
+  ): Promise<"completed" | "fenced">;
+  release(
+    lookupKey: Uint8Array,
+    fencingToken: bigint,
+    executor?: SqlExecutor,
+  ): Promise<"released" | "fenced">;
+  purgeExpired(limit: number, executor?: SqlExecutor): Promise<number>;
 }
 
 const SCHEMA_VERSION = 1;
@@ -37,8 +81,8 @@ interface RecordRow {
   retention_expired: boolean;
 }
 
-/** A lease-mode {@link Store} on Postgres; see migrations/001_init.sql for the schema. */
-export function postgresStore(options: PostgresStoreOptions): Store {
+/** A {@link PostgresStore} on the caller's pool; see migrations/001_init.sql for the schema. */
+export function postgresStore(options: PostgresStoreOptions): PostgresStore {
   const schema = options.schema ?? "public";
   if (!SCHEMA_NAME.test(schema)) {
     throw new IdemfenceStoreError(
@@ -46,15 +90,16 @@ export function postgresStore(options: PostgresStoreOptions): Store {
       "Option `schema` must match /^[a-z_][a-z0-9_]{0,62}$/.",
     );
   }
-  return new PostgresStore(options.pool, schema);
+  return new PgStore(options.pool, schema, lockTimeoutMs(options.lockTimeout));
 }
 
-class PostgresStore implements Store {
+class PgStore implements PostgresStore {
   private readonly sql: Sql;
 
   constructor(
     private readonly pool: Pool,
     schema: string,
+    readonly lockTimeoutMs: number,
   ) {
     this.sql = statements(
       `"${schema}".idemfence_meta`,
@@ -88,15 +133,20 @@ class PostgresStore implements Store {
     }
   }
 
+  transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+    return withTransaction(this.pool, { lockTimeout: this.lockTimeoutMs }, fn);
+  }
+
   async begin(
     lookupKey: Uint8Array,
     fingerprint: Uint8Array,
     leaseMs: number,
     retentionMs: number,
+    executor: SqlExecutor = this.pool,
   ): Promise<BeginResult> {
     const key = bytes(lookupKey);
     for (let attempt = 1; attempt <= BEGIN_ATTEMPTS; attempt += 1) {
-      const acquired = await this.pool.query<{
+      const acquired = await executor.query<{
         fencing_token: string;
         attempts: number;
       }>(this.sql.begin, [key, bytes(fingerprint), leaseMs, retentionMs]);
@@ -112,7 +162,7 @@ class PostgresStore implements Store {
       // The row exists and could not be taken over: classify it. It may have vanished or
       // expired between the two statements; then the insert is simply tried again.
       const existing = (
-        await this.pool.query<RecordRow>(this.sql.classify, [key])
+        await executor.query<RecordRow>(this.sql.classify, [key])
       ).rows[0];
       if (existing === undefined || existing.retention_expired) {
         continue;
@@ -147,8 +197,9 @@ class PostgresStore implements Store {
     lookupKey: Uint8Array,
     fencingToken: bigint,
     leaseMs: number,
+    executor: SqlExecutor = this.pool,
   ): Promise<"renewed" | "fenced"> {
-    const result = await this.pool.query(this.sql.renew, [
+    const result = await executor.query(this.sql.renew, [
       bytes(lookupKey),
       fencingToken.toString(),
       leaseMs,
@@ -160,8 +211,9 @@ class PostgresStore implements Store {
     lookupKey: Uint8Array,
     fencingToken: bigint,
     response: StoredResponse,
+    executor: SqlExecutor = this.pool,
   ): Promise<"completed" | "fenced"> {
-    const result = await this.pool.query(this.sql.complete, [
+    const result = await executor.query(this.sql.complete, [
       bytes(lookupKey),
       fencingToken.toString(),
       response.status,
@@ -175,16 +227,20 @@ class PostgresStore implements Store {
   async release(
     lookupKey: Uint8Array,
     fencingToken: bigint,
+    executor: SqlExecutor = this.pool,
   ): Promise<"released" | "fenced"> {
-    const result = await this.pool.query(this.sql.release, [
+    const result = await executor.query(this.sql.release, [
       bytes(lookupKey),
       fencingToken.toString(),
     ]);
     return result.rowCount === 1 ? "released" : "fenced";
   }
 
-  async purgeExpired(limit: number): Promise<number> {
-    const result = await this.pool.query(this.sql.purge, [limit]);
+  async purgeExpired(
+    limit: number,
+    executor: SqlExecutor = this.pool,
+  ): Promise<number> {
+    const result = await executor.query(this.sql.purge, [limit]);
     return result.rowCount ?? 0;
   }
 }

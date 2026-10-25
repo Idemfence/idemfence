@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { type IdemfenceOptions, resolveConfig } from "../src/config.js";
+import {
+  type IdemfenceOptions,
+  resolveConfig,
+  resolveRoute,
+} from "../src/config.js";
 import {
   IdemfenceConfigError,
   type IdemfenceConfigErrorCode,
@@ -290,5 +294,43 @@ describe("IdemfenceConfigError codes", () => {
       { required: 1 },
       { required: {} },
     ]);
+  });
+});
+
+describe("route mode", () => {
+  it("defaults to lease and accepts transactional on a store with transaction()", () => {
+    const transactional = {
+      ...store,
+      lockTimeoutMs: 250,
+      async transaction<T>(fn: (tx: never) => Promise<T>) {
+        return fn(undefined as never);
+      },
+    };
+    const config = resolveConfig({ ...required(), store: transactional });
+    expect(resolveRoute(config, { routeTemplate: "/a" }).mode).toBe("lease");
+    expect(
+      resolveRoute(config, { routeTemplate: "/a", mode: "transactional" }).mode,
+    ).toBe("transactional");
+  });
+
+  it("ROUTE_MODE_INVALID for a value other than lease or transactional", () => {
+    const config = resolveConfig(required());
+    for (const mode of ["tx", "", 1, "LEASE"]) {
+      expect(() =>
+        resolveRoute(config, { routeTemplate: "/a", mode } as never),
+      ).toThrow(expect.objectContaining({ code: "ROUTE_MODE_INVALID" }));
+    }
+  });
+
+  it("MODE_UNSUPPORTED when the store cannot open transactions", () => {
+    const config = resolveConfig(required());
+    expect(() =>
+      resolveRoute(config, { routeTemplate: "/a", mode: "transactional" }),
+    ).toThrow(
+      expect.objectContaining({
+        name: "IdemfenceConfigError",
+        code: "MODE_UNSUPPORTED",
+      }),
+    );
   });
 });

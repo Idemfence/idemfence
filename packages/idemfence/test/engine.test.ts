@@ -64,6 +64,7 @@ function makeEngine(
 beforeAll(async () => {
   pool = new pg.Pool({ connectionString: url, max: 10 });
   await migrate(url, schema);
+  await pool.query(`CREATE TABLE "${schema}".orders (id text PRIMARY KEY)`);
   engine = makeEngine();
   shortLease = makeEngine({ lease: "300ms" });
 });
@@ -1062,10 +1063,90 @@ describe("logging (contract section 8)", () => {
   });
 });
 
+describe("handler context: tx", () => {
+  const TX_ROUTE: RouteConfig = {
+    routeTemplate: "/orders",
+    mode: "transactional",
+  };
+  const orderRow = async (id: string) =>
+    (await pool.query(`SELECT id FROM "${schema}".orders WHERE id = $1`, [id]))
+      .rowCount;
+
+  it("lease mode: ctx.tx is absent", async () => {
+    let seen: unknown = "unset";
+    const response = await engine.handle(
+      req(freshKey(), { body: "{}" }),
+      ROUTE,
+      async (_request, ctx) => {
+        seen = ctx.tx;
+        expect("tx" in ctx).toBe(false);
+        return created();
+      },
+    );
+    expect(response.status).toBe(201);
+    expect(seen).toBeUndefined();
+  });
+
+  it("transactional mode: ctx.tx runs inside a transaction that commits with the handler", async () => {
+    const key = freshKey();
+    const id = `order-${key}`;
+    const response = await engine.handle(
+      req(key, { body: "{}" }),
+      TX_ROUTE,
+      async (_request, ctx) => {
+        if (ctx.tx === undefined) {
+          throw new Error("ctx.tx missing");
+        }
+        await ctx.tx.query(`INSERT INTO "${schema}".orders (id) VALUES ($1)`, [
+          id,
+        ]);
+        const shown = await ctx.tx.query<{ lock_timeout: string }>(
+          "SHOW lock_timeout",
+        );
+        expect(shown.rows[0]?.lock_timeout).toBe("250ms");
+        // Not yet committed: another connection cannot see it.
+        expect(await orderRow(id)).toBe(0);
+        return created();
+      },
+    );
+    expect(response.status).toBe(201);
+    expect(await orderRow(id)).toBe(1);
+    expect(await record(key)).toMatchObject({ state: "completed" });
+  });
+
+  it("transactional mode: a throw rolls the handler's writes back", async () => {
+    const key = freshKey();
+    const id = `order-${key}`;
+    const mark = logs.length;
+    let hadTx = false;
+    const response = await engine.handle(
+      req(key, { body: "{}" }),
+      TX_ROUTE,
+      async (_request, ctx) => {
+        hadTx = ctx.tx !== undefined;
+        await ctx.tx?.query(`INSERT INTO "${schema}".orders (id) VALUES ($1)`, [
+          id,
+        ]);
+        throw new Error("after writing");
+      },
+    );
+    expect(response.status).toBe(500);
+    expect(hadTx).toBe(true);
+    expect(await orderRow(id)).toBe(0);
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({ row: 12 }),
+      }),
+    ]);
+  });
+});
+
 describe("route validation", () => {
   it("rejects an invalid route template and non-boolean flags on first use", async () => {
     for (const [route, code] of [
       [{ routeTemplate: "orders" }, "ROUTE_TEMPLATE_INVALID"],
+      [{ routeTemplate: "/orders", mode: "tx" }, "ROUTE_MODE_INVALID"],
       [{ routeTemplate: "" }, "ROUTE_TEMPLATE_INVALID"],
       [{ routeTemplate: "/a b" }, "ROUTE_TEMPLATE_INVALID"],
       [{ routeTemplate: "/orders", failOpen: "yes" }, "ROUTE_FLAG_INVALID"],

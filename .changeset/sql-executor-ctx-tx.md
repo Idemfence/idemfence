@@ -1,0 +1,5 @@
+---
+"idemfence": minor
+---
+
+Add the transactional-mode plumbing. `SqlExecutor` (`query(text, params)` returning `{ rows, rowCount }`) is the interface a `pg` `Pool` or `PoolClient` already satisfies; every operation of `idemfence/postgres` accepts one as an optional last argument so the record can be written inside a caller's transaction, and `postgresStore` takes a `lockTimeout` option (default `"250ms"`, validated with `LOCK_TIMEOUT_INVALID`). `withTransaction(pool, { lockTimeout? }, fn)` runs `fn` on one pooled client inside `BEGIN` and `SET LOCAL lock_timeout`, commits when it resolves, rolls back when it rejects, and destroys the client instead of returning it to the pool when the connection broke or `ROLLBACK` failed. A route with `mode: "transactional"` (validated with `ROUTE_MODE_INVALID`; `MODE_UNSUPPORTED` when the store has no `transaction()`) runs its handler inside such a transaction and exposes it as `ctx.tx`; in lease mode `ctx.tx` is absent. The record itself still follows lease mode until the transactional contract rows land.

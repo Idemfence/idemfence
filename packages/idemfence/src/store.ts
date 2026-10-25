@@ -52,6 +52,27 @@ export type BeginResult =
   /** The key is in flight under a valid lease with the same fingerprint (row 8). */
   | { readonly outcome: "in_flight"; readonly retryAfterMs: number };
 
+/** The part of a query result idemfence reads. */
+export interface SqlResult<R> {
+  readonly rows: R[];
+  /** Rows affected by a statement, or null when the driver does not report it. */
+  readonly rowCount: number | null;
+}
+
+/**
+ * Runs parameterised SQL (`$1`, `$2`, ... placeholders) on one connection, pool or
+ * transaction. A `pg` `Pool` and `PoolClient` satisfy it as they are; another driver plugs
+ * in by implementing `query`. In transactional mode the handler receives the transaction's
+ * executor as `ctx.tx`, and a store that supports the mode accepts an executor on each
+ * operation so the record is written inside the caller's transaction.
+ */
+export interface SqlExecutor {
+  query<R extends object = Record<string, unknown>>(
+    text: string,
+    params?: readonly unknown[],
+  ): Promise<SqlResult<R>>;
+}
+
 /**
  * Lease-mode storage (docs/contract.md section 7). All time comparisons use the store's own
  * clock. Every write after `begin` is conditional on the fencing token and reports `"fenced"`
@@ -82,4 +103,15 @@ export interface Store {
   ): Promise<"released" | "fenced">;
   /** Deletes up to `limit` records past retention, never a live lease; returns the count. */
   purgeExpired(limit: number): Promise<number>;
+}
+
+/**
+ * A store that can also run the handler inside one of its transactions (transactional mode,
+ * docs/contract.md section 7). `transaction` commits when `fn` resolves, rolls back when it
+ * rejects, and holds one connection for the whole call.
+ */
+export interface TransactionalStore extends Store {
+  /** The `lock_timeout` applied to each transaction, in milliseconds. */
+  readonly lockTimeoutMs: number;
+  transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T>;
 }
