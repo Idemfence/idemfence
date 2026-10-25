@@ -34,7 +34,10 @@ import type { Store, TransactionalStore } from "./store.js";
  *   of at most 2147483647 milliseconds (the Postgres `lock_timeout` maximum).
  * - `ROUTE_MODE_INVALID`: a route's `mode` is not `"lease"` or `"transactional"`.
  * - `MODE_UNSUPPORTED`: a route uses `mode: "transactional"` but the configured store has no
- *   `transaction` function.
+ *   `openTransaction` function.
+ * - `FAIL_OPEN_TRANSACTIONAL`: a route sets both `failOpen: true` and
+ *   `mode: "transactional"`. Fail-open runs the handler without the store, and a
+ *   transactional handler needs the store's transaction.
  */
 export type IdemfenceConfigErrorCode =
   | "STORE_INVALID"
@@ -57,7 +60,8 @@ export type IdemfenceConfigErrorCode =
   | "WEBCRYPTO_MISSING"
   | "LOCK_TIMEOUT_INVALID"
   | "ROUTE_MODE_INVALID"
-  | "MODE_UNSUPPORTED";
+  | "MODE_UNSUPPORTED"
+  | "FAIL_OPEN_TRANSACTIONAL";
 
 /** Thrown at construction when idemfence options are invalid. Messages never include secrets. */
 export class IdemfenceConfigError extends Error {
@@ -75,8 +79,9 @@ export type KeySyntax = "sf-string" | "sf-string-or-raw";
 /**
  * How a route's record is written (docs/contract.md section 7). `"lease"` claims the record
  * with a lease and a fencing token. `"transactional"` runs the handler inside one of the
- * store's transactions, exposed to it as `ctx.tx`; the store must implement
- * `transaction()`.
+ * store's transactions, exposed to it as `ctx.tx`, and writes the record inside that same
+ * transaction, so the record and the handler's writes commit or roll back together; the
+ * store must implement `openTransaction()`.
  */
 export type RouteMode = "lease" | "transactional";
 
@@ -165,7 +170,10 @@ export interface RouteConfig {
   storeUnavailableRetryAfter?: Duration;
   /** Replay `Set-Cookie` headers for this route (contract section 5); default false. */
   allowSetCookieReplay?: boolean;
-  /** Run the handler without idempotency when the store is unavailable (row 14); default false. */
+  /**
+   * Run the handler without idempotency when the store is unavailable (row 14); default
+   * false. Not allowed with `mode: "transactional"` (`FAIL_OPEN_TRANSACTIONAL`).
+   */
   failOpen?: boolean;
   /** `"lease"` (default) or `"transactional"`; see {@link RouteMode}. */
   mode?: RouteMode;
@@ -342,7 +350,7 @@ export function resolveRoute<TRequest>(
       "Route option `routeTemplate` must be 1 to 2048 printable ASCII characters starting with `/`.",
     );
   }
-  return Object.freeze({
+  const resolved: ResolvedRoute = {
     routeTemplate: template,
     mode: routeMode(config.store, route.mode),
     required: booleanOption(
@@ -394,7 +402,14 @@ export function resolveRoute<TRequest>(
       route.failOpen,
       false,
     ),
-  });
+  };
+  if (resolved.failOpen && resolved.mode === "transactional") {
+    throw new IdemfenceConfigError(
+      "FAIL_OPEN_TRANSACTIONAL",
+      'Route options `failOpen: true` and `mode: "transactional"` cannot be combined: fail-open runs the handler without the store, and a transactional handler runs inside the store\'s transaction.',
+    );
+  }
+  return Object.freeze(resolved);
 }
 
 /**
@@ -427,11 +442,11 @@ function routeMode(store: Store, value: unknown): RouteMode {
   }
   if (
     resolved === "transactional" &&
-    typeof (store as Partial<TransactionalStore>).transaction !== "function"
+    typeof (store as Partial<TransactionalStore>).openTransaction !== "function"
   ) {
     throw new IdemfenceConfigError(
       "MODE_UNSUPPORTED",
-      'Route option `mode: "transactional"` requires a store with a transaction function, such as idemfence/postgres.',
+      'Route option `mode: "transactional"` requires a store with an openTransaction function, such as idemfence/postgres.',
     );
   }
   return resolved;

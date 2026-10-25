@@ -5,9 +5,10 @@ import {
   IdemfenceStoreError,
   type SqlExecutor,
   type StoredResponse,
+  type StoreTransaction,
   type TransactionalStore,
 } from "../../store.js";
-import { withTransaction } from "./transaction.js";
+import { openTransaction } from "./transaction.js";
 
 export {
   type BeginResult,
@@ -17,6 +18,7 @@ export {
   type SqlResult,
   type Store,
   type StoredResponse,
+  type StoreTransaction,
   type TransactionalStore,
 } from "../../store.js";
 export { type TransactionOptions, withTransaction } from "./transaction.js";
@@ -27,8 +29,10 @@ export interface PostgresStoreOptions {
   /** Schema holding the idemfence tables; default `public`. */
   schema?: string;
   /**
-   * `lock_timeout` for the transactions this store opens (transactional mode); default
-   * `"250ms"`. Invalid values throw `IdemfenceConfigError` with code `LOCK_TIMEOUT_INVALID`.
+   * How long `begin` inside a transaction (transactional mode) waits for another transaction
+   * holding the same key before answering in flight; default `"250ms"`. It applies to
+   * `begin`'s own statements only. Invalid values throw `IdemfenceConfigError` with code
+   * `LOCK_TIMEOUT_INVALID`.
    */
   lockTimeout?: Duration;
 }
@@ -40,6 +44,8 @@ const SCHEMA_VERSION = 1;
 const SCHEMA_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
 const BEGIN_ATTEMPTS = 3;
 const UNDEFINED_TABLE = "42P01";
+const LOCK_NOT_AVAILABLE = "55P03";
+const SERIALIZATION_FAILURE = "40001";
 
 interface RecordRow {
   state: "in_flight" | "completed";
@@ -104,8 +110,8 @@ class PgStore implements PostgresStore {
     }
   }
 
-  transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T> {
-    return withTransaction(this.pool, { lockTimeout: this.lockTimeoutMs }, fn);
+  openTransaction(): Promise<StoreTransaction> {
+    return openTransaction(this.pool);
   }
 
   async begin(
@@ -113,7 +119,60 @@ class PgStore implements PostgresStore {
     fingerprint: Uint8Array,
     leaseMs: number,
     retentionMs: number,
-    executor: SqlExecutor = this.pool,
+    executor?: SqlExecutor,
+  ): Promise<BeginResult> {
+    if (executor === undefined) {
+      return this.claim(
+        this.pool,
+        lookupKey,
+        fingerprint,
+        leaseMs,
+        retentionMs,
+      );
+    }
+    // Inside the caller's transaction a concurrent holder of the key is waited for only up
+    // to lockTimeoutMs, and only by begin's own statements: the previous lock_timeout comes
+    // back before the caller's next statement.
+    const scoped = await executor.query<{ previous: string }>(
+      this.sql.scopeLockTimeout,
+      [`${this.lockTimeoutMs}ms`],
+    );
+    const previous = scoped.rows[0]?.previous;
+    if (previous === undefined) {
+      throw new Error("current_setting('lock_timeout') returned no row.");
+    }
+    let result: BeginResult;
+    try {
+      result = await this.claim(
+        executor,
+        lookupKey,
+        fingerprint,
+        leaseMs,
+        retentionMs,
+      );
+    } catch (error) {
+      // The holder kept the key past the lock timeout, or (REPEATABLE READ, SERIALIZABLE)
+      // committed it during the wait: either way a retry sees it in flight or completed.
+      // The caller's transaction is now aborted; the caller rolls it back.
+      if (
+        isPgError(error) &&
+        (error.code === LOCK_NOT_AVAILABLE ||
+          error.code === SERIALIZATION_FAILURE)
+      ) {
+        return { outcome: "in_flight", retryAfterMs: this.lockTimeoutMs };
+      }
+      throw error;
+    }
+    await executor.query(this.sql.restoreLockTimeout, [previous]);
+    return result;
+  }
+
+  private async claim(
+    executor: SqlExecutor,
+    lookupKey: Uint8Array,
+    fingerprint: Uint8Array,
+    leaseMs: number,
+    retentionMs: number,
   ): Promise<BeginResult> {
     const key = bytes(lookupKey);
     for (let attempt = 1; attempt <= BEGIN_ATTEMPTS; attempt += 1) {
@@ -222,6 +281,15 @@ type Sql = ReturnType<typeof statements>;
 function statements(meta: string, records: string, sequence: string) {
   return {
     version: `SELECT version FROM ${meta}`,
+
+    // The MATERIALIZED CTE yields its row, read before the change, before the outer target
+    // list sets the new value, so one round trip both captures and sets. is_local = true:
+    // the setting ends with the transaction.
+    scopeLockTimeout: `
+      WITH before AS MATERIALIZED (SELECT current_setting('lock_timeout') AS previous)
+      SELECT previous, set_config('lock_timeout', $1, true) FROM before`,
+
+    restoreLockTimeout: `SELECT set_config('lock_timeout', $1, true)`,
 
     // A takeover (expired lease with the same fingerprint, or retention expired with no live
     // lease) draws a new fencing token so the

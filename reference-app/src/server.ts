@@ -3,8 +3,11 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import {
   createIdemfence,
+  type HandlerContext,
   type Idemfence,
   IdemfenceConfigError,
+  type RouteMode,
+  type SqlExecutor,
 } from "idemfence";
 import { idempotent } from "idemfence/fetch";
 import { postgresStore } from "idemfence/postgres";
@@ -17,6 +20,7 @@ interface Config {
   secret: string;
   docsUrl: string;
   port: number;
+  mode: RouteMode;
 }
 
 function readConfig(env: NodeJS.ProcessEnv): Config {
@@ -41,10 +45,14 @@ function readConfig(env: NodeJS.ProcessEnv): Config {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     problems.push("PORT must be an integer from 1 to 65535");
   }
+  const mode = env.IDEMFENCE_MODE ?? "lease";
+  if (mode !== "lease" && mode !== "transactional") {
+    problems.push('IDEMFENCE_MODE must be "lease" or "transactional"');
+  }
   if (problems.length > 0) {
     throw new Error(`invalid configuration:\n  - ${problems.join("\n  - ")}`);
   }
-  return { databaseUrl, secret, docsUrl, port };
+  return { databaseUrl, secret, docsUrl, port, mode: mode as RouteMode };
 }
 
 // The conformance suite identifies the caller with an X-Principal header. A real application
@@ -129,8 +137,18 @@ function parseCreateOrder(body: unknown): CreateOrder | string {
   return { item, simulateWorkMs: (simulateWorkMs as number | undefined) ?? 0 };
 }
 
+/**
+ * Where the handlers write. In transactional mode that is `ctx.tx`, so an order commits
+ * together with the idempotency record, or rolls back with it. In lease mode, and on the
+ * non-conforming routes, which have no idemfence context, it is the pool.
+ */
+const db = (ctx?: HandlerContext): SqlExecutor => ctx?.tx ?? pool;
+
 /** Inserts one order, waits the simulated work, returns 201 { id, item }. */
-async function createOrderHandler(request: Request): Promise<Response> {
+async function createOrderHandler(
+  request: Request,
+  ctx?: HandlerContext,
+): Promise<Response> {
   let body: unknown;
   try {
     body = await request.json();
@@ -141,7 +159,7 @@ async function createOrderHandler(request: Request): Promise<Response> {
   if (typeof order === "string") {
     return Response.json({ error: order }, { status: 400 });
   }
-  const inserted = await pool.query<{ id: string }>(
+  const inserted = await db(ctx).query<{ id: string }>(
     "INSERT INTO orders (item) VALUES ($1) RETURNING id::text AS id",
     [order.item],
   );
@@ -154,14 +172,32 @@ async function createOrderHandler(request: Request): Promise<Response> {
   );
 }
 
-async function releaseHandler(): Promise<Response> {
+// In transactional mode the release and throws fixtures first insert an order through
+// ctx.tx, so the conformance suite's order count proves the rollback (rows 11 and 13). In
+// lease mode there is no ctx.tx and they stay free of side effects.
+async function fixtureOrder(
+  ctx: HandlerContext | undefined,
+  item: string,
+): Promise<void> {
+  await ctx?.tx?.query("INSERT INTO orders (item) VALUES ($1)", [item]);
+}
+
+async function releaseHandler(
+  _request: Request,
+  ctx?: HandlerContext,
+): Promise<Response> {
+  await fixtureOrder(ctx, "released fixture");
   return new Response("later", {
     status: 429,
     headers: { "retry-after": "1" },
   });
 }
 
-async function throwsHandler(): Promise<Response> {
+async function throwsHandler(
+  _request: Request,
+  ctx?: HandlerContext,
+): Promise<Response> {
+  await fixtureOrder(ctx, "throws fixture");
   throw new Error("the fixture handler always throws");
 }
 
@@ -211,25 +247,27 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-// Idempotent routes: the main endpoint and the conformance fixtures.
+// Idempotent routes: the main endpoint and the conformance fixtures, all in the configured
+// mode (IDEMFENCE_MODE).
+const { mode } = config;
 const createOrder = idempotent(
   idem,
-  { routeTemplate: "/orders" },
+  { routeTemplate: "/orders", mode },
   createOrderHandler,
 );
 const release = idempotent(
   idem,
-  { routeTemplate: "/fixtures/release" },
+  { routeTemplate: "/fixtures/release", mode },
   releaseHandler,
 );
 const throws = idempotent(
   idem,
-  { routeTemplate: "/fixtures/throws" },
+  { routeTemplate: "/fixtures/throws", mode },
   throwsHandler,
 );
 const shortRetention = idempotent(
   shortRetentionIdem,
-  { routeTemplate: "/fixtures/short-retention" },
+  { routeTemplate: "/fixtures/short-retention", mode },
   createOrderHandler,
 );
 app.post("/orders", (c) => createOrder(c.req.raw));
@@ -243,8 +281,8 @@ app.post("/fixtures/passthrough", (c) => passthroughHandler(c.req.raw));
 // suite can be shown failing. Never do this in a real application.
 const nonconforming = new Hono();
 nonconforming.post("/orders", (c) => createOrderHandler(c.req.raw));
-nonconforming.post("/release", () => releaseHandler());
-nonconforming.post("/throws", () => throwsHandler());
+nonconforming.post("/release", (c) => releaseHandler(c.req.raw));
+nonconforming.post("/throws", (c) => throwsHandler(c.req.raw));
 nonconforming.post("/short-retention", (c) => createOrderHandler(c.req.raw));
 nonconforming.post("/passthrough", (c) => passthroughHandler(c.req.raw));
 app.route("/nonconforming", nonconforming);
@@ -253,7 +291,7 @@ const server = serve(
   { fetch: app.fetch, port: config.port, hostname: "0.0.0.0" },
   (info) => {
     console.log(
-      `idemfence reference app listening on ${info.address}:${info.port}`,
+      `idemfence reference app listening on ${info.address}:${info.port} (${mode} mode)`,
     );
   },
 );

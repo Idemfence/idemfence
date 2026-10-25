@@ -24,6 +24,24 @@ Exit status is 0 only when no scenario failed and, with `--require-all`, none wa
 Rows 9, 13 and 14 are not testable black-box and are reported as such; they never fail and
 are not counted by `--require-all`.
 
+## Modes
+
+The config's `mode` says which idemfence mode the target's routes use (docs/contract.md
+section 7): `"lease"` (the default) or `"transactional"`. In transactional mode:
+
+- row 13 is tested: the `throws` fixture's first response must be a 500 `about:blank`
+  problem that is not replayed, a retry with the same key must be another fresh 500 (the
+  throw was rolled back, not stored), and the side-effect count must not change, so the
+  fixture should write a side effect before it throws;
+- row 11 also checks that the side-effect count did not change (the release rolls the
+  handler's writes back);
+- rows 9 and 12 do not apply (a crashed handler's transaction rolls back; a throw is not
+  stored) and are reported as `not applicable in transactional mode`, with the outcome
+  `not_applicable` in JSON. Like not-testable rows they never fail and are not counted by
+  `--require-all`. The JSON summary then has a `notApplicable` count.
+
+In lease mode the output is the same as before modes existed.
+
 ## The Concurrency group
 
 `--group concurrency` fires `--iterations` bursts (default 1000) of `--concurrency` identical
@@ -82,6 +100,7 @@ environment, for example the reference app's compose stack, and discard it after
 | `keyMaxLength` | yes | The target's maximum key length (1–255), for the over-length case of row 3. |
 | `requestBodyCap` | yes | The target's request body cap in bytes, for row 15. |
 | `keySyntax` | no | `sf-string` (default) or `sf-string-or-raw`. With raw syntax an unquoted key is valid, so row 3 does not send one. |
+| `mode` | no | `lease` (default) or `transactional`; see "Modes" above. |
 | `fixtures` | no | Routes the target provides; any may be absent. A scenario that needs a missing fixture reports `not run: fixture <name> missing`. |
 
 Every fixture except `count` and `noPrincipal` has `method`, `path` and an optional JSON
@@ -93,7 +112,7 @@ Every fixture except `count` and `noPrincipal` has `method`, `path` and an optio
 | `count` | all rows that check side effects | `path` only; `GET` must return `{ "count": n }`. |
 | `slow` | 8, 16, concurrency | `workMs`: how long the handler takes (at least 500). `workField` (optional, default `simulateWorkMs`): the body field the concurrency group sets to a random 0–20 ms. |
 | `release` | 11 | `status`: the release status the route returns (400–599). |
-| `throws` | 12 | none; the handler must throw. |
+| `throws` | 12 (lease), 13 (transactional) | none; the handler must throw (in transactional mode, after writing a side effect). |
 | `shortRetention` | 10 | `retentionMs`: the route's retention (at least 100). The suite waits `retentionMs + 600`. |
 | `passthrough` | 1 | none; a route or method the target does not make idempotent. |
 | `noPrincipal` | 4 | `omitHeaders`: headers to leave out so the target sees no principal. |

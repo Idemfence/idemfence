@@ -288,8 +288,10 @@ used for lease decisions.
 transaction, so the record and the handler's writes commit or roll back together (rows 11
 and 13). A concurrent request with the same key waits on the uncommitted record up to the
 configured lock timeout, then receives 409 [in-flight](#in-flight) with `Retry-After` set to
-that timeout in whole seconds, rounded up (minimum 1). Row 9 does not apply: a crashed
-handler's transaction rolls back and frees the key.
+that timeout in whole seconds, rounded up (minimum 1). The lock timeout applies only to the
+statements that claim the record: once the record is claimed, the previous `lock_timeout` is
+restored, so the handler's own statements run with the connection's normal setting. Row 9
+does not apply: a crashed handler's transaction rolls back and frees the key.
 
 ## 8. Logging
 

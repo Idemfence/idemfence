@@ -40,8 +40,10 @@ async function main(): Promise<number> {
     return 2;
   }
 
+  // Lease is the default; only a transactional target is named, so lease output is unchanged.
+  const transactional = config.mode === "transactional";
   console.error(
-    `idemfence-conformance: running the ${options.group === "concurrency" ? "Concurrency" : "Contract"} group against ${options.url}; every scenario creates real side effects in the target.`,
+    `idemfence-conformance: running the ${options.group === "concurrency" ? "Concurrency" : "Contract"} group against ${options.url}${transactional ? " in transactional mode" : ""}; every scenario creates real side effects in the target.`,
   );
   if (options.group === "concurrency") {
     let result: Awaited<ReturnType<typeof runConcurrencyGroup>>;
@@ -70,10 +72,19 @@ async function main(): Promise<number> {
   const summary = summarize(results, options.requireAll);
   if (options.json) {
     console.log(
-      JSON.stringify({ url: options.url, results, summary }, null, 2),
+      JSON.stringify(
+        {
+          url: options.url,
+          ...(transactional ? { mode: config.mode } : {}),
+          results,
+          summary,
+        },
+        null,
+        2,
+      ),
     );
   } else {
-    console.log(formatHuman(options.url, results, summary));
+    console.log(formatHuman(options.url, results, summary, config.mode));
   }
   return summary.ok ? 0 : 1;
 }

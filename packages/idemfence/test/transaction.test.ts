@@ -411,21 +411,34 @@ describe("withTransaction error classification", () => {
   });
 });
 
-describe("postgresStore.transaction", () => {
-  it("runs the function in a transaction with the store's lockTimeout", async () => {
+describe("postgresStore.openTransaction", () => {
+  it("opens a transaction without touching lock_timeout; begin scopes the store's lockTimeout to itself", async () => {
     const configured = postgresStore({ pool, schema, lockTimeout: "750ms" });
     expect(configured.lockTimeoutMs).toBe(750);
     expect(store.lockTimeoutMs).toBe(250);
     const k = key();
-    await configured.transaction(async (tx) => {
-      const shown = await tx.query<{ lock_timeout: string }>(
-        "SHOW lock_timeout",
-      );
-      expect(shown.rows[0]?.lock_timeout).toBe("750ms");
-      await configured.begin(k, fp, 5_000, 60_000, tx);
-      await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-store-tx"]);
-    });
+    const connectionDefault = (
+      await pool.query<{ lock_timeout: string }>("SHOW lock_timeout")
+    ).rows[0]?.lock_timeout;
+    const transaction = await configured.openTransaction();
+    const tx = transaction.executor;
+    const shown = async () =>
+      (await tx.query<{ lock_timeout: string }>("SHOW lock_timeout")).rows[0]
+        ?.lock_timeout;
+    expect(await shown()).toBe(connectionDefault);
+    await tx.query("SET LOCAL lock_timeout = '3s'");
+    const begun = await configured.begin(k, fp, 5_000, 60_000, tx);
+    expect(begun.outcome).toBe("acquired");
+    // Restored to exactly what was in effect before begin.
+    expect(await shown()).toBe("3s");
+    await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-store-tx"]);
+    await transaction.commit();
     expect(await visible(k, "o-store-tx")).toEqual({ record: 1, order: 1 });
+    // The transaction has ended: its executor refuses to reach the connection.
+    await expect(tx.query("SELECT 1")).rejects.toMatchObject({
+      name: "IdemfenceStoreError",
+      code: "TRANSACTION_ENDED",
+    });
   });
 
   it("accepts the executor on renew, complete, release and purgeExpired", async () => {

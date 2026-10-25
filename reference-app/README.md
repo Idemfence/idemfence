@@ -1,15 +1,15 @@
 # idemfence reference app
 
 A small [Hono](https://hono.dev) service on Node that uses idemfence through its public
-exports only (`idemfence`, `idemfence/fetch`, `idemfence/postgres`), in lease mode on
-PostgreSQL. It is the target for the conformance suite and a worked example of wiring
-idemfence into an application.
+exports only (`idemfence`, `idemfence/fetch`, `idemfence/postgres`) on PostgreSQL, in lease
+or transactional mode (`IDEMFENCE_MODE`). It is the target for the conformance suite and a
+worked example of wiring idemfence into an application.
 
 ## Endpoints
 
 | Method and path | Behaviour |
 | --------------- | --------- |
-| `POST /orders` | Idempotent (route template `/orders`). Body `{ "item": string, "simulateWorkMs"?: integer 0–30000 }`. Inserts one row into `orders`, waits `simulateWorkMs`, returns `201 { "id", "item" }`. |
+| `POST /orders` | Idempotent (route template `/orders`). Body `{ "item": string, "simulateWorkMs"?: integer 0–30000 }`. Inserts one row into `orders`, waits `simulateWorkMs`, returns `201 { "id", "item" }`. In transactional mode the insert goes through `ctx.tx`, so it commits together with the idempotency record. |
 | `GET /orders/count` | `{ "count": n }`: the number of rows in `orders`. |
 | `GET /healthz` | `200` once idemfence's `ready()` has verified the schema, otherwise `503`. |
 
@@ -19,17 +19,20 @@ These routes exist for the conformance suite (`packages/conformance`) and stay p
 
 | Method and path | Behaviour |
 | --------------- | --------- |
-| `POST /fixtures/release` | Idempotent; always answers `429` (a release status), so the key stays reusable (row 11). |
-| `POST /fixtures/throws` | Idempotent; the handler throws (row 12). |
+| `POST /fixtures/release` | Idempotent; always answers `429` (a release status), so the key stays reusable (row 11). In transactional mode it first inserts an order through `ctx.tx`, which the release rolls back. |
+| `POST /fixtures/throws` | Idempotent; the handler throws (row 12 in lease mode, row 13 in transactional mode). In transactional mode it first inserts an order through `ctx.tx`, which the throw rolls back. |
 | `POST /fixtures/short-retention` | Idempotent with a 500 ms lease and 1.5 s retention; same body and effect as `POST /orders` (row 10). |
 | `POST /fixtures/passthrough` | Not idempotent; echoes the body (row 1). |
 | `POST /nonconforming/{orders,release,throws,short-retention,passthrough}` | The same handlers **without idemfence**, so the suite can be shown failing. Never do this in a real application. |
 
-`conformance.json` points the suite at the idempotent routes and `conformance.nonconforming.json`
-at the non-conforming group:
+`conformance.json` points the suite at the idempotent routes in lease mode,
+`conformance.transactional.json` at the same routes in transactional mode (the app started
+with `IDEMFENCE_MODE=transactional`), and `conformance.nonconforming.json` at the
+non-conforming group:
 
 ```sh
 node ../packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config conformance.json --require-all
+node ../packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config conformance.transactional.json --require-all   # IDEMFENCE_MODE=transactional
 node ../packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config conformance.nonconforming.json   # exits 1
 ```
 
@@ -55,6 +58,7 @@ a message listing every problem.
 | `IDEMFENCE_SECRET` | yes | At least 32 bytes. No default. `openssl rand -hex 32` makes one. |
 | `DOCS_URL` | yes | `https://` URL of your published idempotency documentation; problem `type` URIs point into it. |
 | `PORT` | yes | Port to listen on (1–65535). |
+| `IDEMFENCE_MODE` | no | `lease` (default) or `transactional`: the mode of every idempotent route. compose passes `lease` unless it is set. |
 
 With compose, `POSTGRES_PASSWORD` is also required; `.env.example` lists them all. Copy it
 to `.env` and fill in the secrets. Never commit `.env`.
@@ -68,6 +72,9 @@ docker compose up --build --wait
 bash smoke.sh            # keyed POST, replay, count
 docker compose down -v   # stop and discard the database
 ```
+
+For transactional mode, set `IDEMFENCE_MODE=transactional` in `.env` (or in the shell)
+before `docker compose up`.
 
 `compose.yaml` starts three services: `postgres` (the digest-pinned `postgres:18.4` image
 that CI tests against), `migrate` (a one-shot job that applies idemfence's

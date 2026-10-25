@@ -19,9 +19,7 @@ import {
 import { lookupKey } from "../src/hash.js";
 import {
   postgresStore,
-  type SqlExecutor,
   type TransactionalStore,
-  withTransaction,
 } from "../src/stores/postgres/index.js";
 import { connectionFields, databaseUrl, migrate } from "./support/postgres.js";
 
@@ -755,10 +753,10 @@ describe("row 14: store unavailable", () => {
   });
 
   it("transactional mode: a transaction that cannot be opened is a 503, not a stored 500, and frees the key", async () => {
-    // The record operations reach Postgres; opening the handler's transaction does not.
+    // ready() reaches Postgres; opening the handler's transaction does not.
     const live = postgresStore({ pool, schema });
+    const dead = postgresStore({ pool: deadPool, schema });
     const txStore: TransactionalStore = {
-      ...live,
       ready: () => live.ready(),
       begin: (...args) => live.begin(...args),
       renew: (...args) => live.renew(...args),
@@ -766,8 +764,7 @@ describe("row 14: store unavailable", () => {
       release: (...args) => live.release(...args),
       purgeExpired: (...args) => live.purgeExpired(...args),
       lockTimeoutMs: live.lockTimeoutMs,
-      transaction: <T>(fn: (tx: SqlExecutor) => Promise<T>) =>
-        withTransaction(deadPool, {}, fn),
+      openTransaction: () => dead.openTransaction(),
     };
     const txUnavailable = createEngine(
       resolveConfig<Request>({
@@ -885,58 +882,14 @@ describe("row 14: store unavailable", () => {
       ).rowCount,
     ).toBe(0);
     expect(await record(key)).toBeUndefined();
+    // complete() is the first statement to hit the aborted transaction.
     expect(logsSince(mark)).toEqual([
       expect.objectContaining({
         level: "error",
         fields: expect.objectContaining({
           row: 14,
           outcome: "store-unavailable",
-          error: expect.objectContaining({ code: "COMMIT_REJECTED" }),
-        }),
-      }),
-    ]);
-  });
-
-  it("transactional mode: a connection failure during COMMIT is a 503 that keeps the lease (outcome unknown)", async () => {
-    const key = freshKey();
-    const route: RouteConfig = {
-      routeTemplate: "/orders",
-      mode: "transactional",
-      storeUnavailableRetryAfter: "4s",
-    };
-    const observer = new pg.Client({ connectionString: url });
-    await observer.connect();
-    const mark = logs.length;
-    try {
-      const response = await engine.handle(
-        req(key, { body: "{}" }),
-        route,
-        async (_request, ctx) => {
-          const pid = (
-            await ctx.tx?.query<{ pid: number }>(
-              "SELECT pg_backend_pid() AS pid",
-            )
-          )?.rows[0]?.pid;
-          await observer.query("SELECT pg_terminate_backend($1)", [pid]);
-          await sleep(50);
-          return created();
-        },
-      );
-      await expectProblem(response, 503, "store-unavailable");
-      expect(response.headers.get("retry-after")).toBe("4");
-    } finally {
-      await observer.end();
-    }
-    // The commit may have landed, so the lease is kept: the key is not free until 2.2 moves
-    // the record into the transaction or the lease expires.
-    expect(await record(key)).toMatchObject({ state: "in_flight" });
-    expect(logsSince(mark)).toEqual([
-      expect.objectContaining({
-        level: "error",
-        fields: expect.objectContaining({
-          row: 14,
-          outcome: "commit-unknown",
-          error: expect.objectContaining({ code: "COMMIT_UNKNOWN" }),
+          error: expect.objectContaining({ code: "25P02" }),
         }),
       }),
     ]);
@@ -1297,6 +1250,9 @@ describe("handler context: tx", () => {
   it("transactional mode: ctx.tx runs inside a transaction that commits with the handler", async () => {
     const key = freshKey();
     const id = `order-${key}`;
+    const connectionDefault = (
+      await pool.query<{ lock_timeout: string }>("SHOW lock_timeout")
+    ).rows[0]?.lock_timeout;
     const response = await engine.handle(
       req(key, { body: "{}" }),
       TX_ROUTE,
@@ -1310,10 +1266,11 @@ describe("handler context: tx", () => {
         await ctx.tx.query(`INSERT INTO "${schema}".orders (id) VALUES ($1)`, [
           id,
         ]);
+        // The store's lock timeout covers begin only; the handler sees the connection's own.
         const shown = await ctx.tx.query<{ lock_timeout: string }>(
           "SHOW lock_timeout",
         );
-        expect(shown.rows[0]?.lock_timeout).toBe("250ms");
+        expect(shown.rows[0]?.lock_timeout).toBe(connectionDefault);
         // Not yet committed: another connection cannot see it.
         expect(await orderRow(id)).toBe(0);
         return created();
@@ -1391,10 +1348,11 @@ describe("handler context: tx", () => {
     expect(response.status).toBe(500);
     expect(hadTx).toBe(true);
     expect(await orderRow(id)).toBe(0);
+    expect(await record(key)).toBeUndefined();
     expect(logsSince(mark)).toEqual([
       expect.objectContaining({
         level: "error",
-        fields: expect.objectContaining({ row: 12 }),
+        fields: expect.objectContaining({ row: 13, outcome: "handler-error" }),
       }),
     ]);
   });

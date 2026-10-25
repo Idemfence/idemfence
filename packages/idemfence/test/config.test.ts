@@ -298,12 +298,12 @@ describe("IdemfenceConfigError codes", () => {
 });
 
 describe("route mode", () => {
-  it("defaults to lease and accepts transactional on a store with transaction()", () => {
+  it("defaults to lease and accepts transactional on a store with openTransaction()", () => {
     const transactional = {
       ...store,
       lockTimeoutMs: 250,
-      async transaction<T>(fn: (tx: never) => Promise<T>) {
-        return fn(undefined as never);
+      async openTransaction() {
+        return undefined as never;
       },
     };
     const config = resolveConfig({ ...required(), store: transactional });

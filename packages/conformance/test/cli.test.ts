@@ -11,9 +11,11 @@ import {
   classifyIteration,
   formatHuman,
   KEY_PREFIX,
+  NOT_APPLICABLE_IN_TRANSACTIONAL_MODE,
   newKey,
   parseCliArgs,
   type RowResult,
+  runContractGroup,
   SIDE_EFFECTS_MESSAGE,
   summarize,
   validateConfig,
@@ -129,8 +131,15 @@ describe("validateConfig", () => {
       keyMaxLength: 255,
       requestBodyCap: 1024,
       keySyntax: "sf-string",
+      mode: "lease",
       fixtures: {},
     });
+  });
+
+  it("accepts mode transactional", () => {
+    expect(validateConfig({ ...minimal, mode: "transactional" }).mode).toBe(
+      "transactional",
+    );
   });
 
   it("accepts every fixture", () => {
@@ -194,6 +203,8 @@ describe("validateConfig", () => {
     [{ keyMaxLength: 256, requestBodyCap: 1 }, "keyMaxLength must be"],
     [{ keyMaxLength: 255 }, "requestBodyCap must be"],
     [{ ...minimal, keySyntax: "raw" }, "keySyntax must be"],
+    [{ ...minimal, mode: "tx" }, 'mode must be "lease" or "transactional"'],
+    [{ ...minimal, mode: true }, 'mode must be "lease" or "transactional"'],
     [{ ...minimal, headers: { a: 1 } }, "headers.a must be a string"],
     [
       { ...minimal, fixtures: { create: { method: "POST", path: "/x" } } },
@@ -315,6 +326,95 @@ describe("summarize and formatHuman", () => {
     expect(text).toMatch(
       /summary: 1 passed, 0 failed, 1 not run, 1 not testable, 1 skipped: OK$/,
     );
+    expect(text.split("\n")[0]).toBe(
+      "idemfence conformance, Contract group, target http://t",
+    );
+  });
+
+  const transactional: RowResult[] = [
+    { row: "1", title: "a", outcome: "pass", messages: [], durationMs: 1 },
+    {
+      row: "12",
+      title: "d",
+      outcome: "not_applicable",
+      messages: [
+        `${NOT_APPLICABLE_IN_TRANSACTIONAL_MODE}: a throw is not stored`,
+      ],
+      durationMs: 0,
+    },
+    { row: "13", title: "e", outcome: "pass", messages: [], durationMs: 1 },
+  ];
+
+  it("counts not-applicable rows separately; --require-all accepts them", () => {
+    expect(summarize(transactional, true)).toStrictEqual({
+      pass: 2,
+      fail: 0,
+      notRun: 0,
+      notTestable: 0,
+      notApplicable: 1,
+      skipped: 0,
+      ok: true,
+    });
+    // Absent, not zero, when no row is not applicable.
+    expect("notApplicable" in summarize(results, false)).toBe(false);
+  });
+
+  it("labels not-applicable rows and names the transactional mode", () => {
+    const text = formatHuman(
+      "http://t",
+      transactional,
+      summarize(transactional, true),
+      "transactional",
+    );
+    const lines = text.split("\n");
+    expect(lines[0]).toBe(
+      "idemfence conformance, Contract group, target http://t, transactional mode",
+    );
+    expect(text).toContain("row 12  not applicable d");
+    expect(text).toContain("row 13  pass           e");
+    expect(text).toContain(
+      "      not applicable in transactional mode: a throw is not stored",
+    );
+    expect(text).not.toContain("not testable black-box");
+    expect(text).toMatch(
+      /summary: 2 passed, 0 failed, 0 not run, 0 not testable, 1 not applicable, 0 skipped: OK$/,
+    );
+  });
+});
+
+describe("runContractGroup and the target's mode", () => {
+  // Rows that need no request: the rest are skipped, so nothing is sent.
+  const offline = { ...minimal, acknowledgeSideEffects: true as const };
+
+  it("lease mode: rows 9, 13 and 14 are not testable", async () => {
+    const results = await runContractGroup(
+      "http://127.0.0.1:1",
+      validateConfig(offline),
+      { only: [9, 13, 14] },
+    );
+    const byRow = Object.fromEntries(results.map((r) => [r.row, r]));
+    for (const row of ["9", "13", "14"]) {
+      expect(byRow[row]?.outcome).toBe("not_testable");
+    }
+    expect(byRow["13"]?.messages).toStrictEqual([
+      "not testable black-box here (covered by step 2.2)",
+    ]);
+  });
+
+  it("transactional mode: rows 9 and 12 are not applicable, row 14 stays not testable", async () => {
+    const results = await runContractGroup(
+      "http://127.0.0.1:1",
+      validateConfig({ ...offline, mode: "transactional" }),
+      { only: [9, 12, 14] },
+    );
+    const byRow = Object.fromEntries(results.map((r) => [r.row, r]));
+    expect(byRow["9"]?.outcome).toBe("not_applicable");
+    expect(byRow["12"]?.outcome).toBe("not_applicable");
+    expect(byRow["12"]?.messages[0]).toMatch(
+      /^not applicable in transactional mode: /,
+    );
+    expect(byRow["14"]?.outcome).toBe("not_testable");
+    expect(results.filter((r) => r.outcome === "skipped")).toHaveLength(13);
   });
 });
 
