@@ -2,7 +2,10 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-/** One line the child server wrote; see child-server.mjs for the shapes. */
+/**
+ * One event the child server reported, on stdout or over IPC; see child-server.mjs for the
+ * shapes.
+ */
 export interface ChildEvent {
   event: string;
   [field: string]: unknown;
@@ -16,6 +19,10 @@ export interface ChildServerOptions {
   route: string;
   lease?: string;
   mode?: "lease" | "transactional";
+  /** The child's handler; see child-server.mjs. Default `"until-abort"`. */
+  handler?: "until-abort" | "crash";
+  /** Crash handler only: where the child stops and waits to be killed. */
+  killAt?: "P1" | "P2" | "P3" | "P4";
 }
 
 /**
@@ -56,8 +63,12 @@ export async function startChildServer(
       CHILD_ROUTE: options.route,
       CHILD_LEASE: options.lease ?? "30s",
       CHILD_MODE: options.mode ?? "lease",
+      CHILD_HANDLER: options.handler ?? "until-abort",
+      ...(options.killAt === undefined
+        ? {}
+        : { CHILD_KILL_AT: options.killAt }),
     },
-    stdio: ["ignore", "pipe", "inherit"],
+    stdio: ["ignore", "pipe", "inherit", "ipc"],
   });
   const exited = new Promise<void>((resolve) => {
     child.once("exit", () => resolve());
@@ -70,13 +81,7 @@ export async function startChildServer(
   if (child.stdout === null) {
     throw new Error("child stdout is not piped");
   }
-  createInterface({ input: child.stdout }).on("line", (line) => {
-    let event: ChildEvent;
-    try {
-      event = JSON.parse(line) as ChildEvent;
-    } catch {
-      event = { event: "stdout", line };
-    }
+  const record = (event: ChildEvent) => {
     events.push(event);
     for (const waiter of waiters) {
       if (waiter.match(event)) {
@@ -84,6 +89,19 @@ export async function startChildServer(
         waiter.resolve(event);
       }
     }
+  };
+  createInterface({ input: child.stdout }).on("line", (line) => {
+    let event: ChildEvent;
+    try {
+      event = { ...(JSON.parse(line) as ChildEvent), via: "stdout" };
+    } catch {
+      event = { event: "stdout", line };
+    }
+    record(event);
+  });
+  // Kill points arrive over IPC as well, so a test can act on them without parsing output.
+  child.on("message", (message) => {
+    record({ ...(message as ChildEvent), via: "ipc" });
   });
 
   const waitFor = (
