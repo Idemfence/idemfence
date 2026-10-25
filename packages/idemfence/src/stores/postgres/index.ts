@@ -170,22 +170,11 @@ class PgStore implements PostgresStore {
     leaseMs: number,
     executor: SqlExecutor = this.pool,
   ): Promise<"renewed" | "fenced"> {
-    const params = [bytes(lookupKey), fencingToken.toString(), leaseMs];
-    if (executor === this.pool) {
-      const result = await executor.query(this.sql.renew, params);
-      return result.rowCount === 1 ? "renewed" : "fenced";
-    }
-    // Inside the caller's transaction: a failed renew (for example a lock_timeout on the
-    // record row) must not abort the handler's transaction, so it runs in a savepoint.
-    await executor.query("SAVEPOINT idemfence_renew");
-    let result: { rowCount: number | null };
-    try {
-      result = await executor.query(this.sql.renew, params);
-    } catch (error) {
-      await executor.query("ROLLBACK TO SAVEPOINT idemfence_renew");
-      throw error;
-    }
-    await executor.query("RELEASE SAVEPOINT idemfence_renew");
+    const result = await executor.query(this.sql.renew, [
+      bytes(lookupKey),
+      fencingToken.toString(),
+      leaseMs,
+    ]);
     return result.rowCount === 1 ? "renewed" : "fenced";
   }
 

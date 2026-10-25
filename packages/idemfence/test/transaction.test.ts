@@ -428,39 +428,6 @@ describe("postgresStore.transaction", () => {
     expect(await visible(k, "o-store-tx")).toEqual({ record: 1, order: 1 });
   });
 
-  it("a renew that fails inside the transaction does not abort it", async () => {
-    const k = key();
-    const begun = await store.begin(k, fp, 5_000, 60_000);
-    if (begun.outcome !== "acquired") {
-      throw new Error(`unexpected ${begun.outcome}`);
-    }
-    // Another session holds the record's row lock, so the renew UPDATE hits lock_timeout.
-    const locker = new pg.Client({ connectionString: url });
-    await locker.connect();
-    try {
-      await locker.query("BEGIN");
-      await locker.query(
-        `SELECT 1 FROM ${records} WHERE lookup_key = $1 FOR UPDATE`,
-        [Buffer.from(k)],
-      );
-      await withTransaction(pool, {}, async (tx) => {
-        await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, [
-          "o-renew-fail",
-        ]);
-        await expect(
-          store.renew(k, begun.fencingToken, 5_000, tx),
-        ).rejects.toMatchObject({ code: "55P03" });
-        // Still usable: the failed renew was confined to a savepoint.
-        const alive = await tx.query<{ n: number }>("SELECT 1::int AS n");
-        expect(alive.rows[0]?.n).toBe(1);
-      });
-    } finally {
-      await locker.query("ROLLBACK");
-      await locker.end();
-    }
-    expect(await visible(k, "o-renew-fail")).toEqual({ record: 1, order: 1 });
-  });
-
   it("accepts the executor on renew, complete, release and purgeExpired", async () => {
     const k = key();
     const token = await withTransaction(pool, {}, async (tx) => {

@@ -15,6 +15,8 @@ import {
   type Handler,
   type HandlerContext,
   IdemfenceFencedError,
+  type LeaseHandlerContext,
+  type TransactionalHandlerContext,
 } from "./engine.js";
 
 export {
@@ -34,10 +36,12 @@ export type {
   IdemfenceConfigErrorCode,
   IdemfenceOptions,
   KeySyntax,
+  LeaseHandlerContext,
   LogFields,
   Logger,
   RouteConfig,
   RouteMode,
+  TransactionalHandlerContext,
 };
 export { IdemfenceConfigError, IdemfenceFencedError };
 

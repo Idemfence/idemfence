@@ -13,6 +13,7 @@ import {
 import {
   createEngine,
   type Engine,
+  type Handler,
   IdemfenceFencedError,
 } from "../src/engine.js";
 import { lookupKey } from "../src/hash.js";
@@ -426,12 +427,12 @@ describe("rows 5 to 10: record state", () => {
     const key = freshKey();
     const releaseA = deferred<void>();
     let renewError: unknown;
-    const handlerA = async (
-      _request: Request,
-      ctx: { renew(): Promise<void> },
-    ) => {
+    const handlerA: Handler = async (_request, ctx) => {
       await releaseA.promise;
       try {
+        if (ctx.renew === undefined) {
+          throw new Error("lease mode must expose ctx.renew");
+        }
         await ctx.renew();
       } catch (error) {
         renewError = error;
@@ -823,12 +824,7 @@ describe("row 14: store unavailable", () => {
       mode: "transactional",
     };
     let runs = 0;
-    const handler = async (
-      _request: Request,
-      ctx: {
-        tx?: { query(t: string, p?: readonly unknown[]): Promise<unknown> };
-      },
-    ) => {
+    const handler: Handler = async (_request, ctx) => {
       runs += 1;
       // Violates the deferred constraint, so BEGIN and the handler succeed and COMMIT fails.
       await ctx.tx?.query(
@@ -1290,6 +1286,7 @@ describe("handler context: tx", () => {
       async (_request, ctx) => {
         seen = ctx.tx;
         expect("tx" in ctx).toBe(false);
+        expect(typeof ctx.renew).toBe("function");
         return created();
       },
     );
@@ -1307,6 +1304,9 @@ describe("handler context: tx", () => {
         if (ctx.tx === undefined) {
           throw new Error("ctx.tx missing");
         }
+        // The transaction is the lease: no renew in this mode (not even a stub).
+        expect("renew" in ctx).toBe(false);
+        expect(ctx.renew).toBeUndefined();
         await ctx.tx.query(`INSERT INTO "${schema}".orders (id) VALUES ($1)`, [
           id,
         ]);
@@ -1324,9 +1324,9 @@ describe("handler context: tx", () => {
     expect(await record(key)).toMatchObject({ state: "completed" });
   });
 
-  it("transactional mode: ctx.renew() runs on the transaction, so a saturated pool cannot deadlock", async () => {
-    // One connection in the pool, held by the handler's transaction: a renew that went
-    // through the pool would wait for it forever.
+  it("transactional mode: the handler's transaction is the only connection ever taken", async () => {
+    // One connection in the pool, held by the handler's transaction: anything else the
+    // engine tried to do through the pool while the handler runs would wait forever.
     const single = new pg.Pool({ connectionString: url, max: 1 });
     single.on("error", () => {});
     try {
@@ -1340,19 +1340,31 @@ describe("handler context: tx", () => {
         }),
       );
       const key = freshKey();
-      let renewed = "not called";
-      const response = await singleEngine.handle(
-        req(key, { body: "{}" }),
-        TX_ROUTE,
-        async (_request, ctx) => {
-          renewed = await Promise.race([
-            ctx.renew().then(() => "renewed"),
-            sleep(2_000).then(() => "timed out"),
-          ]);
-          return created();
-        },
-      );
-      expect(renewed).toBe("renewed");
+      const id = `order-${key}`;
+      let inside: { total: number; idle: number; waiting: number } | undefined;
+      const response = await Promise.race([
+        singleEngine.handle(
+          req(key, { body: "{}" }),
+          TX_ROUTE,
+          async (_request, ctx) => {
+            expect(ctx.renew).toBeUndefined();
+            await ctx.tx?.query(
+              `INSERT INTO "${schema}".orders (id) VALUES ($1)`,
+              [id],
+            );
+            inside = {
+              total: single.totalCount,
+              idle: single.idleCount,
+              waiting: single.waitingCount,
+            };
+            return created();
+          },
+        ),
+        sleep(3_000).then(() => {
+          throw new Error("handle() hung on the one-connection pool");
+        }),
+      ]);
+      expect(inside).toEqual({ total: 1, idle: 0, waiting: 0 });
       expect(response.status).toBe(201);
       expect(await record(key)).toMatchObject({ state: "completed" });
     } finally {

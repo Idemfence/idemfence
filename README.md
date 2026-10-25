@@ -43,7 +43,10 @@ A route with `mode: "transactional"` runs its handler inside one of the store's
 transactions and passes it to the handler as `ctx.tx`, a `SqlExecutor`
 (`query(text, params)`, the interface a `pg` `Pool` or `PoolClient` already satisfies).
 Everything the handler writes through `ctx.tx` commits when the handler returns and rolls
-back when it throws. In lease mode `ctx.tx` is absent.
+back when it throws. The transaction is the lease, so `ctx.renew` is absent in this mode:
+a lease update inside the uncommitted transaction would be invisible to other sessions and
+would row-lock the record. In lease mode it is the other way round: `ctx.renew()` extends
+the lease and `ctx.tx` is absent.
 
 ```ts
 import { createIdemfence } from "idemfence";

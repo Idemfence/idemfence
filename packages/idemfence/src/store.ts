@@ -131,8 +131,9 @@ export interface TransactionalStore extends Store {
   /**
    * Every operation also takes an optional executor; given one, it runs on it (inside the
    * caller's transaction) instead of on the store's own connections. Inside `transaction`,
-   * operations MUST be given its executor: taking a second connection while holding one
-   * would deadlock a saturated pool.
+   * an operation MUST be given its executor: taking a second connection while holding one
+   * would deadlock a saturated pool. `renew` has no place inside a transaction: the update
+   * would be invisible to other sessions until commit and would row-lock the record.
    */
   begin(
     lookupKey: Uint8Array,

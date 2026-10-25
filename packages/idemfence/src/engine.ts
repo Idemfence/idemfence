@@ -31,15 +31,30 @@ export class IdemfenceFencedError extends Error {
   }
 }
 
-export interface HandlerContext {
+/** The handler's context in lease mode (the default). */
+export interface LeaseHandlerContext {
   /** Extends the lease; rejects with {@link IdemfenceFencedError} once fenced. */
   renew(): Promise<void>;
-  /**
-   * In a route with `mode: "transactional"`, the handler's transaction: every query on it
-   * commits when the handler returns and rolls back when it throws. Absent in lease mode.
-   */
-  readonly tx?: SqlExecutor;
+  /** Absent in lease mode. */
+  readonly tx?: undefined;
 }
+
+/**
+ * The handler's context in a route with `mode: "transactional"`. The transaction is the
+ * lease, so there is no `renew`: a lease update inside the uncommitted transaction would be
+ * invisible to other sessions and would row-lock the record.
+ */
+export interface TransactionalHandlerContext {
+  /** Absent in transactional mode. */
+  readonly renew?: undefined;
+  /**
+   * The handler's transaction: every query on it commits when the handler returns and
+   * rolls back when it throws.
+   */
+  readonly tx: SqlExecutor;
+}
+
+export type HandlerContext = LeaseHandlerContext | TransactionalHandlerContext;
 
 export type Handler = (
   request: Request,
@@ -96,7 +111,7 @@ type HandlerOutcome =
   /** Transactional mode only: the transaction could not be opened or committed. */
   | { kind: "unavailable"; error: unknown };
 
-const passthroughContext: HandlerContext = {
+const passthroughContext: LeaseHandlerContext = {
   async renew() {},
 };
 
@@ -262,7 +277,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     attempts: number,
   ): Promise<Response> {
     const row = attempts > 1 ? 9 : 5;
-    const ctx: HandlerContext = {
+    const ctx: LeaseHandlerContext = {
       async renew() {
         if ((await store.renew(key, fencingToken, config.lease)) === "fenced") {
           throw new IdemfenceFencedError();
@@ -275,24 +290,9 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       // The handler runs inside one store transaction and sees it as ctx.tx; a throw rolls
       // its writes back. Writing the record inside that transaction (contract rows 11 and
       // 13) is not implemented yet: the record still follows lease mode.
-      outcome = await inTransaction(request, handler, (tx) => ({
-        ...ctx,
-        tx,
-        // On the transaction's executor: a second connection from the same pool, while
-        // this one is held, would deadlock once the pool is saturated.
-        async renew() {
-          if (
-            (await (store as TransactionalStore).renew(
-              key,
-              fencingToken,
-              config.lease,
-              tx,
-            )) === "fenced"
-          ) {
-            throw new IdemfenceFencedError();
-          }
-        },
-      }));
+      // No renew here: the transaction is the lease, and the engine takes no second
+      // connection while the handler holds this one (a saturated pool would deadlock).
+      outcome = await inTransaction(request, handler, (tx) => ({ tx }));
       if (outcome.kind === "unavailable") {
         // Row 14, both ways a 503 with Retry-After rather than a stored 500, which would be
         // replayed for an operation that never ran.
