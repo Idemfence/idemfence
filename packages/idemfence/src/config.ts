@@ -30,7 +30,7 @@ import type { Store, TransactionalStore } from "./store.js";
  * - `ROUTE_METHODS_INVALID`: a fetch route's `methods` is not a non-empty array of HTTP
  *   method tokens.
  * - `WEBCRYPTO_MISSING`: `globalThis.crypto.subtle` is not available in this runtime.
- * - `LOCK_TIMEOUT_INVALID`: a store's or transaction's `lockTimeout` is not a valid duration
+ * - `LOCK_TIMEOUT_INVALID`: a store's `lockTimeout` is not a valid duration
  *   of at most 2147483647 milliseconds (the Postgres `lock_timeout` maximum).
  * - `ROUTE_MODE_INVALID`: a route's `mode` is not `"lease"` or `"transactional"`.
  * - `MODE_UNSUPPORTED`: a route uses `mode: "transactional"` but the configured store has no

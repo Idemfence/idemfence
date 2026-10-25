@@ -1,71 +1,26 @@
 import type { Pool, PoolClient } from "pg";
-import { type Duration, lockTimeoutMs } from "../../config.js";
-import {
-  IdemfenceStoreError,
-  type SqlExecutor,
-  type StoreTransaction,
-} from "../../store.js";
-
-export interface TransactionOptions {
-  /**
-   * `SET LOCAL lock_timeout` for the whole transaction; default `"250ms"`. A statement that
-   * waits longer than this for a lock fails. The store's `begin` scopes its own wait to the
-   * store's `lockTimeout` whatever this is, and restores this value before returning.
-   * Invalid values throw `IdemfenceConfigError` with code `LOCK_TIMEOUT_INVALID`.
-   */
-  lockTimeout?: Duration;
-}
+import { IdemfenceStoreError, type StoreTransaction } from "../../store.js";
 
 /**
- * Runs `fn` inside one transaction on a client taken from `pool`: `BEGIN`, `SET LOCAL
- * lock_timeout`, `fn(tx)`, then `COMMIT` when `fn` resolves or `ROLLBACK` when it rejects,
- * in which case the rejection is rethrown unchanged. The client is always returned to the
- * pool, and destroyed instead when the connection errored or `ROLLBACK` itself failed, so a
+ * `BEGIN` on a client taken from `pool`, returned as a {@link StoreTransaction}. `commit`
+ * and `rollback` each end the transaction and release the client exactly once; the client
+ * is destroyed instead of returned when the connection errored or `ROLLBACK` failed, so a
  * connection whose state is unknown never serves another caller. Once the transaction has
- * ended, a query on `tx` rejects with `TRANSACTION_ENDED` without reaching the client.
+ * ended, a query on its executor rejects with `TRANSACTION_ENDED` without reaching the
+ * client.
  *
- * Failures of the transaction itself reject with `IdemfenceStoreError` (the driver's error
- * as `cause`): `TRANSACTION_UNAVAILABLE` when no client could be taken or `BEGIN` or
- * `SET LOCAL` failed (nothing ran); `COMMIT_REJECTED` when the server answered `COMMIT`
- * with an error or with a `ROLLBACK` tag because the transaction was already aborted
- * (rolled back for certain); `COMMIT_UNKNOWN` when the connection failed
- * during `COMMIT` with no answer from the server (the transaction may have committed).
+ * Failures reject with `IdemfenceStoreError` (the driver's error as `cause`):
+ * `TRANSACTION_UNAVAILABLE` when no client could be taken or `BEGIN` failed (nothing ran);
+ * from `commit`, `COMMIT_REJECTED` when the server answered `COMMIT` with an error or with
+ * a `ROLLBACK` tag because the transaction was already aborted (rolled back for certain),
+ * and `COMMIT_UNKNOWN` when the connection failed during `COMMIT` with no answer from the
+ * server (the transaction may have committed).
  *
- * The transaction holds the connection for the whole call: size the pool for the number of
+ * The transaction holds the connection until it ends: size the pool for the number of
  * handlers that may run at once, and set `idle_in_transaction_session_timeout` on the server
  * so a stalled handler cannot pin a connection forever.
  */
-export async function withTransaction<T>(
-  pool: Pool,
-  options: TransactionOptions,
-  fn: (tx: SqlExecutor) => Promise<T>,
-): Promise<T> {
-  // Validated before a client is taken, so a bad option never costs a connection.
-  const lockTimeout = lockTimeoutMs(options.lockTimeout);
-  const transaction = await openTransaction(pool, lockTimeout);
-  let result: T;
-  try {
-    result = await fn(transaction.executor);
-  } catch (error) {
-    // A failed ROLLBACK has already destroyed the client; fn's rejection is what the caller
-    // needs to see.
-    await transaction.rollback().catch(() => undefined);
-    throw error;
-  }
-  await transaction.commit();
-  return result;
-}
-
-/**
- * `BEGIN` (and, with `lockTimeout`, `SET LOCAL lock_timeout`) on a client taken from
- * `pool`, returned as a {@link StoreTransaction}. `commit` and `rollback` each end the
- * transaction and release the client exactly once; the client is destroyed instead of
- * returned when the connection errored or `ROLLBACK` failed.
- */
-export async function openTransaction(
-  pool: Pool,
-  lockTimeout?: number,
-): Promise<StoreTransaction> {
+export async function openTransaction(pool: Pool): Promise<StoreTransaction> {
   let client: PoolClient;
   try {
     client = await pool.connect();
@@ -99,11 +54,6 @@ export async function openTransaction(
 
   try {
     await client.query("BEGIN");
-    if (lockTimeout !== undefined) {
-      // lock_timeout is a server setting, not a bind parameter; the value is a validated
-      // integer.
-      await client.query(`SET LOCAL lock_timeout = '${lockTimeout}ms'`);
-    }
   } catch (error) {
     // ROLLBACK here is for the client's sake: on a dead connection it fails and marks the
     // client broken, so it is destroyed instead of going back to the pool.

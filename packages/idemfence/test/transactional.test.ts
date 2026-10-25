@@ -104,7 +104,7 @@ beforeAll(async () => {
     WHEN (NEW.response_status = 218)
     EXECUTE FUNCTION "${schema}".die_at_commit()`);
   const app = new Hono();
-  app.post("/r/:name", (c) => {
+  app.on(["POST", "GET"], "/r/:name", (c) => {
     const route = routes.get(c.req.param("name"));
     return route === undefined ? c.notFound() : route(c.req.raw);
   });
@@ -177,6 +177,21 @@ async function post(
     method: "POST",
     headers,
     body,
+  });
+  const text = await response.text();
+  return {
+    status: response.status,
+    headers: response.headers,
+    body: text,
+    elapsedMs: performance.now() - startedAt,
+  };
+}
+
+/** A GET carrying an Idempotency-Key, which the default methods (POST, PATCH) ignore. */
+async function get(path: string): Promise<Reply> {
+  const startedAt = performance.now();
+  const response = await fetch(`${base}${path}`, {
+    headers: { "x-principal": "user-1", "idempotency-key": `"${freshKey()}"` },
   });
   const text = await response.text();
   return {
@@ -771,6 +786,105 @@ describe("transactional mode: ctx.tx after the transaction (T6)", () => {
     expect(reply.status).toBe(201);
     expect(await late.promise).toMatchObject({ code: "TRANSACTION_ENDED" });
     expect(await orderCount(tag)).toBe(0);
+  });
+});
+
+describe("methods the fetch adapter does not enforce", () => {
+  const recordCount = async () =>
+    (
+      await observer.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM ${records}`,
+      )
+    ).rows[0]?.n;
+  const deriveOutcome = async (attempt: Promise<string>) => {
+    try {
+      await attempt;
+      return "resolved";
+    } catch (error) {
+      return (error as { code?: string }).code ?? String(error);
+    }
+  };
+
+  it("transactional route: a GET runs in a plain transaction with ctx.tx", async () => {
+    let sawTx = false;
+    let renew: unknown = "unset";
+    let derive = "";
+    const path = mount(
+      idemfence(postgresStore({ pool, schema })),
+      async (_request, ctx) => {
+        sawTx = ctx.tx !== undefined;
+        renew = ctx.renew;
+        derive = await deriveOutcome(ctx.deriveKey("payment-charge"));
+        return Response.json({ ok: true });
+      },
+    );
+    expect((await get(path)).status).toBe(200);
+    expect(sawTx).toBe(true);
+    expect(renew).toBeUndefined();
+    expect(derive).toBe("DERIVE_KEY_UNAVAILABLE");
+  });
+
+  it("transactional route: the GET's insert commits when the handler resolves, and no record is written", async () => {
+    const tag = freshTag();
+    const path = mount(
+      idemfence(postgresStore({ pool, schema })),
+      async (_request, ctx) => {
+        await insertOrder(ctx.tx, tag);
+        // Not committed yet: another session cannot see it.
+        expect(await orderCount(tag)).toBe(0);
+        return Response.json({ ok: true });
+      },
+    );
+    const before = await recordCount();
+    const reply = await get(path);
+    expect(reply.status).toBe(200);
+    expect(reply.headers.get("idempotent-replayed")).toBeNull();
+    expect(await orderCount(tag)).toBe(1);
+    expect(await recordCount()).toBe(before);
+  });
+
+  it("transactional route: the GET's insert rolls back when the handler throws, and the throw propagates", async () => {
+    const tag = freshTag();
+    const path = mount(
+      idemfence(postgresStore({ pool, schema })),
+      async (_request, ctx) => {
+        await insertOrder(ctx.tx, tag);
+        throw new Error("get failed");
+      },
+    );
+    const before = await recordCount();
+    const mark = logs.length;
+    const reply = await get(path);
+    // The throw reached the framework (Hono's default 500), not an idemfence problem.
+    expect(reply.status).toBe(500);
+    expect(reply.headers.get("content-type")).not.toBe(
+      "application/problem+json",
+    );
+    expect(await orderCount(tag)).toBe(0);
+    expect(await recordCount()).toBe(before);
+    expect(logs.slice(mark)).toEqual([]);
+  });
+
+  it("lease route: a GET is unchanged: no ctx.tx, renew does nothing, deriveKey rejects", async () => {
+    let tx: unknown = "unset";
+    let renewed: unknown = "unset";
+    let derive = "";
+    const path = mount(
+      idemfence(postgresStore({ pool, schema })),
+      async (_request, ctx) => {
+        tx = ctx.tx;
+        renewed = await ctx.renew?.();
+        derive = await deriveOutcome(ctx.deriveKey("payment-charge"));
+        return Response.json({ ok: true });
+      },
+      { mode: "lease" },
+    );
+    const before = await recordCount();
+    expect((await get(path)).status).toBe(200);
+    expect(tx).toBeUndefined();
+    expect(renewed).toBeUndefined();
+    expect(derive).toBe("DERIVE_KEY_UNAVAILABLE");
+    expect(await recordCount()).toBe(before);
   });
 });
 

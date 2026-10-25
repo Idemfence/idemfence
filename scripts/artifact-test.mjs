@@ -128,7 +128,7 @@ try {
           "createIdemfence",
         ],
         fetch: ["idempotent"],
-        postgres: ["IdemfenceStoreError", "postgresStore", "withTransaction"],
+        postgres: ["IdemfenceStoreError", "postgresStore"],
         sqlHasRecords: true,
       }),
     `ESM: idemfence, idemfence/fetch, idemfence/postgres and the migration SQL resolve (${JSON.stringify(esmOut)})`,
