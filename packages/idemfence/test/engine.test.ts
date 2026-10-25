@@ -1283,6 +1283,42 @@ describe("handler context: tx", () => {
     expect(await record(key)).toMatchObject({ state: "completed" });
   });
 
+  it("transactional mode: ctx.renew() runs on the transaction, so a saturated pool cannot deadlock", async () => {
+    // One connection in the pool, held by the handler's transaction: a renew that went
+    // through the pool would wait for it forever.
+    const single = new pg.Pool({ connectionString: url, max: 1 });
+    single.on("error", () => {});
+    try {
+      const singleEngine = createEngine(
+        resolveConfig<Request>({
+          store: postgresStore({ pool: single, schema }),
+          scope: (request) => request.headers.get("x-principal") ?? undefined,
+          secret: SECRET,
+          docsUrl: DOCS,
+          logger,
+        }),
+      );
+      const key = freshKey();
+      let renewed = "not called";
+      const response = await singleEngine.handle(
+        req(key, { body: "{}" }),
+        TX_ROUTE,
+        async (_request, ctx) => {
+          renewed = await Promise.race([
+            ctx.renew().then(() => "renewed"),
+            sleep(2_000).then(() => "timed out"),
+          ]);
+          return created();
+        },
+      );
+      expect(renewed).toBe("renewed");
+      expect(response.status).toBe(201);
+      expect(await record(key)).toMatchObject({ state: "completed" });
+    } finally {
+      await single.end();
+    }
+  });
+
   it("transactional mode: a throw rolls the handler's writes back", async () => {
     const key = freshKey();
     const id = `order-${key}`;

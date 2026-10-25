@@ -33,37 +33,8 @@ export interface PostgresStoreOptions {
   lockTimeout?: Duration;
 }
 
-/**
- * The Postgres store. Every operation takes an optional executor; given one, the operation
- * runs on it (inside the caller's transaction) instead of on the pool.
- */
-export interface PostgresStore extends TransactionalStore {
-  begin(
-    lookupKey: Uint8Array,
-    fingerprint: Uint8Array,
-    leaseMs: number,
-    retentionMs: number,
-    executor?: SqlExecutor,
-  ): Promise<BeginResult>;
-  renew(
-    lookupKey: Uint8Array,
-    fencingToken: bigint,
-    leaseMs: number,
-    executor?: SqlExecutor,
-  ): Promise<"renewed" | "fenced">;
-  complete(
-    lookupKey: Uint8Array,
-    fencingToken: bigint,
-    response: StoredResponse,
-    executor?: SqlExecutor,
-  ): Promise<"completed" | "fenced">;
-  release(
-    lookupKey: Uint8Array,
-    fencingToken: bigint,
-    executor?: SqlExecutor,
-  ): Promise<"released" | "fenced">;
-  purgeExpired(limit: number, executor?: SqlExecutor): Promise<number>;
-}
+/** The Postgres store: a {@link TransactionalStore} on the caller's pool. */
+export type PostgresStore = TransactionalStore;
 
 const SCHEMA_VERSION = 1;
 const SCHEMA_NAME = /^[a-z_][a-z0-9_]{0,62}$/;

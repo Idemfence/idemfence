@@ -275,7 +275,24 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       // The handler runs inside one store transaction and sees it as ctx.tx; a throw rolls
       // its writes back. Writing the record inside that transaction (contract rows 11 and
       // 13) is not implemented yet: the record still follows lease mode.
-      outcome = await inTransaction(request, handler, ctx);
+      outcome = await inTransaction(request, handler, (tx) => ({
+        ...ctx,
+        tx,
+        // On the transaction's executor: a second connection from the same pool, while
+        // this one is held, would deadlock once the pool is saturated.
+        async renew() {
+          if (
+            (await (store as TransactionalStore).renew(
+              key,
+              fencingToken,
+              config.lease,
+              tx,
+            )) === "fenced"
+          ) {
+            throw new IdemfenceFencedError();
+          }
+        },
+      }));
       if (outcome.kind === "unavailable") {
         // Row 14, both ways a 503 with Retry-After rather than a stored 500, which would be
         // replayed for an operation that never ran.
@@ -369,14 +386,14 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
   async function inTransaction(
     request: Request,
     handler: Handler,
-    ctx: HandlerContext,
+    context: (tx: SqlExecutor) => HandlerContext,
   ): Promise<HandlerOutcome> {
     let threw: { error: unknown } | undefined;
     try {
       const response = await (store as TransactionalStore).transaction(
         async (tx) => {
           try {
-            return await handler(request, { ...ctx, tx });
+            return await handler(request, context(tx));
           } catch (error) {
             threw = { error };
             throw error;

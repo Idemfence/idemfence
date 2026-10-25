@@ -125,4 +125,35 @@ export interface TransactionalStore extends Store {
   /** The `lock_timeout` applied to each transaction, in milliseconds. */
   readonly lockTimeoutMs: number;
   transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T>;
+  /**
+   * Every operation also takes an optional executor; given one, it runs on it (inside the
+   * caller's transaction) instead of on the store's own connections. Inside `transaction`,
+   * operations MUST be given its executor: taking a second connection while holding one
+   * would deadlock a saturated pool.
+   */
+  begin(
+    lookupKey: Uint8Array,
+    fingerprint: Uint8Array,
+    leaseMs: number,
+    retentionMs: number,
+    executor?: SqlExecutor,
+  ): Promise<BeginResult>;
+  renew(
+    lookupKey: Uint8Array,
+    fencingToken: bigint,
+    leaseMs: number,
+    executor?: SqlExecutor,
+  ): Promise<"renewed" | "fenced">;
+  complete(
+    lookupKey: Uint8Array,
+    fencingToken: bigint,
+    response: StoredResponse,
+    executor?: SqlExecutor,
+  ): Promise<"completed" | "fenced">;
+  release(
+    lookupKey: Uint8Array,
+    fencingToken: bigint,
+    executor?: SqlExecutor,
+  ): Promise<"released" | "fenced">;
+  purgeExpired(limit: number, executor?: SqlExecutor): Promise<number>;
 }

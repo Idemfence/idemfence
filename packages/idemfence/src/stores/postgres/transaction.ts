@@ -72,9 +72,10 @@ export async function withTransaction<T>(
       await client.query("COMMIT");
     } catch (error) {
       await rollback();
-      // An error the server returned for COMMIT means it aborted the transaction. Anything
-      // else (socket closed, client no longer queryable) means COMMIT got no answer.
-      throw isServerError(error)
+      // Only an ordinary ERROR answered by a server that is still talking to us proves the
+      // transaction was aborted. A FATAL or PANIC, a connection-class SQLSTATE, or a client
+      // that the follow-up ROLLBACK found broken may hide a commit that already landed.
+      throw isDefiniteRejection(error) && !broken
         ? new IdemfenceStoreError(
             "COMMIT_REJECTED",
             "The server rejected COMMIT; the transaction was rolled back.",
@@ -110,16 +111,26 @@ function unavailable(error: unknown): IdemfenceStoreError {
   );
 }
 
-/** pg surfaces errors the server returned with a severity and a five-character SQLSTATE. */
-function isServerError(error: unknown): boolean {
+// SQLSTATE classes that describe the connection or the server rather than the statement:
+// 08 connection exception, 57 operator intervention (57P01 admin shutdown and so on),
+// XX internal error.
+const AMBIGUOUS_SQLSTATE_CLASSES = new Set(["08", "57", "XX"]);
+
+/**
+ * True for an error the server returned for the statement itself: pg gives those a
+ * severity and a five-character SQLSTATE. Severity ERROR only; FATAL and PANIC end the
+ * session, and the connection and internal classes say nothing about the transaction.
+ */
+function isDefiniteRejection(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
   }
   const { severity, code } = error as { severity?: unknown; code?: unknown };
   return (
-    typeof severity === "string" &&
+    severity === "ERROR" &&
     typeof code === "string" &&
-    /^[0-9A-Z]{5}$/.test(code)
+    /^[0-9A-Z]{5}$/.test(code) &&
+    !AMBIGUOUS_SQLSTATE_CLASSES.has(code.slice(0, 2))
   );
 }
 
