@@ -13,10 +13,16 @@ import {
 import {
   createEngine,
   type Engine,
+  type Handler,
   IdemfenceFencedError,
 } from "../src/engine.js";
 import { lookupKey } from "../src/hash.js";
-import { postgresStore } from "../src/stores/postgres/index.js";
+import {
+  postgresStore,
+  type SqlExecutor,
+  type TransactionalStore,
+  withTransaction,
+} from "../src/stores/postgres/index.js";
 import { connectionFields, databaseUrl, migrate } from "./support/postgres.js";
 
 const url = databaseUrl();
@@ -64,6 +70,7 @@ function makeEngine(
 beforeAll(async () => {
   pool = new pg.Pool({ connectionString: url, max: 10 });
   await migrate(url, schema);
+  await pool.query(`CREATE TABLE "${schema}".orders (id text PRIMARY KEY)`);
   engine = makeEngine();
   shortLease = makeEngine({ lease: "300ms" });
 });
@@ -420,12 +427,12 @@ describe("rows 5 to 10: record state", () => {
     const key = freshKey();
     const releaseA = deferred<void>();
     let renewError: unknown;
-    const handlerA = async (
-      _request: Request,
-      ctx: { renew(): Promise<void> },
-    ) => {
+    const handlerA: Handler = async (_request, ctx) => {
       await releaseA.promise;
       try {
+        if (ctx.renew === undefined) {
+          throw new Error("lease mode must expose ctx.renew");
+        }
         await ctx.renew();
       } catch (error) {
         renewError = error;
@@ -733,6 +740,206 @@ describe("row 14: store unavailable", () => {
     );
     expect(response.status).toBe(503);
     expect(response.headers.get("retry-after")).toBe("2");
+  });
+
+  it("transactional mode: a store that cannot be reached at begin is a 503, handler not run", async () => {
+    const { handler, calls } = counting();
+    const response = await unreachable.handle(
+      req(freshKey(), { body: "{}" }),
+      { routeTemplate: "/orders", mode: "transactional" },
+      handler,
+    );
+    await expectProblem(response, 503, "store-unavailable");
+    expect(response.headers.get("retry-after")).toBe("5");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("transactional mode: a transaction that cannot be opened is a 503, not a stored 500, and frees the key", async () => {
+    // The record operations reach Postgres; opening the handler's transaction does not.
+    const live = postgresStore({ pool, schema });
+    const txStore: TransactionalStore = {
+      ...live,
+      ready: () => live.ready(),
+      begin: (...args) => live.begin(...args),
+      renew: (...args) => live.renew(...args),
+      complete: (...args) => live.complete(...args),
+      release: (...args) => live.release(...args),
+      purgeExpired: (...args) => live.purgeExpired(...args),
+      lockTimeoutMs: live.lockTimeoutMs,
+      transaction: <T>(fn: (tx: SqlExecutor) => Promise<T>) =>
+        withTransaction(deadPool, {}, fn),
+    };
+    const txUnavailable = createEngine(
+      resolveConfig<Request>({
+        store: txStore,
+        scope: (request) => request.headers.get("x-principal") ?? undefined,
+        secret: SECRET,
+        docsUrl: DOCS,
+        logger,
+      }),
+    );
+    const key = freshKey();
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      mode: "transactional",
+      storeUnavailableRetryAfter: "3s",
+    };
+    const { handler, calls } = counting();
+    const mark = logs.length;
+
+    const response = await txUnavailable.handle(
+      req(key, { body: "{}" }),
+      route,
+      handler,
+    );
+    await expectProblem(response, 503, "store-unavailable");
+    expect(response.headers.get("retry-after")).toBe("3");
+    expect(calls).toHaveLength(0);
+    expect(await record(key)).toBeUndefined();
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          row: 14,
+          outcome: "store-unavailable",
+          error: expect.objectContaining({ name: expect.any(String) }),
+        }),
+      }),
+    ]);
+
+    // The key is free: a retry on a healthy engine runs the handler and completes.
+    const retry = await engine.handle(req(key, { body: "{}" }), route, handler);
+    expect(retry.status).toBe(201);
+    expect(calls).toHaveLength(1);
+    expect(await record(key)).toMatchObject({ state: "completed" });
+  });
+
+  it("transactional mode: a COMMIT failure is a 503 with the handler's writes rolled back and the key free", async () => {
+    await pool.query(
+      `CREATE TABLE "${schema}".deferred (id int UNIQUE DEFERRABLE INITIALLY DEFERRED)`,
+    );
+    const key = freshKey();
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      mode: "transactional",
+    };
+    let runs = 0;
+    const handler: Handler = async (_request, ctx) => {
+      runs += 1;
+      // Violates the deferred constraint, so BEGIN and the handler succeed and COMMIT fails.
+      await ctx.tx?.query(
+        `INSERT INTO "${schema}".deferred (id) VALUES (1), (1)`,
+      );
+      return created();
+    };
+    const mark = logs.length;
+    const response = await engine.handle(
+      req(key, { body: "{}" }),
+      route,
+      handler,
+    );
+    await expectProblem(response, 503, "store-unavailable");
+    expect(runs).toBe(1);
+    expect(
+      (await pool.query(`SELECT count(*)::int AS n FROM "${schema}".deferred`))
+        .rows[0].n,
+    ).toBe(0);
+    expect(await record(key)).toBeUndefined();
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          row: 14,
+          outcome: "store-unavailable",
+        }),
+      }),
+    ]);
+  });
+
+  it("transactional mode: a handler that swallows a failed statement is not stored as a success", async () => {
+    const key = freshKey();
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      mode: "transactional",
+    };
+    const id = `order-${key}`;
+    const mark = logs.length;
+    const response = await engine.handle(
+      req(key, { body: "{}" }),
+      route,
+      async (_request, ctx) => {
+        await ctx.tx?.query(`INSERT INTO "${schema}".orders (id) VALUES ($1)`, [
+          id,
+        ]);
+        await ctx.tx?.query("SELECT 1 / 0").catch(() => undefined);
+        return created();
+      },
+    );
+    // The transaction was aborted, so COMMIT rolled it back: nothing happened.
+    await expectProblem(response, 503, "store-unavailable");
+    expect(
+      (
+        await pool.query(`SELECT id FROM "${schema}".orders WHERE id = $1`, [
+          id,
+        ])
+      ).rowCount,
+    ).toBe(0);
+    expect(await record(key)).toBeUndefined();
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          row: 14,
+          outcome: "store-unavailable",
+          error: expect.objectContaining({ code: "COMMIT_REJECTED" }),
+        }),
+      }),
+    ]);
+  });
+
+  it("transactional mode: a connection failure during COMMIT is a 503 that keeps the lease (outcome unknown)", async () => {
+    const key = freshKey();
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      mode: "transactional",
+      storeUnavailableRetryAfter: "4s",
+    };
+    const observer = new pg.Client({ connectionString: url });
+    await observer.connect();
+    const mark = logs.length;
+    try {
+      const response = await engine.handle(
+        req(key, { body: "{}" }),
+        route,
+        async (_request, ctx) => {
+          const pid = (
+            await ctx.tx?.query<{ pid: number }>(
+              "SELECT pg_backend_pid() AS pid",
+            )
+          )?.rows[0]?.pid;
+          await observer.query("SELECT pg_terminate_backend($1)", [pid]);
+          await sleep(50);
+          return created();
+        },
+      );
+      await expectProblem(response, 503, "store-unavailable");
+      expect(response.headers.get("retry-after")).toBe("4");
+    } finally {
+      await observer.end();
+    }
+    // The commit may have landed, so the lease is kept: the key is not free until 2.2 moves
+    // the record into the transaction or the lease expires.
+    expect(await record(key)).toMatchObject({ state: "in_flight" });
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          row: 14,
+          outcome: "commit-unknown",
+          error: expect.objectContaining({ code: "COMMIT_UNKNOWN" }),
+        }),
+      }),
+    ]);
   });
 
   it("with failOpen, runs the handler without idempotency and logs a warning", async () => {
@@ -1062,10 +1269,142 @@ describe("logging (contract section 8)", () => {
   });
 });
 
+describe("handler context: tx", () => {
+  const TX_ROUTE: RouteConfig = {
+    routeTemplate: "/orders",
+    mode: "transactional",
+  };
+  const orderRow = async (id: string) =>
+    (await pool.query(`SELECT id FROM "${schema}".orders WHERE id = $1`, [id]))
+      .rowCount;
+
+  it("lease mode: ctx.tx is absent", async () => {
+    let seen: unknown = "unset";
+    const response = await engine.handle(
+      req(freshKey(), { body: "{}" }),
+      ROUTE,
+      async (_request, ctx) => {
+        seen = ctx.tx;
+        expect("tx" in ctx).toBe(false);
+        expect(typeof ctx.renew).toBe("function");
+        return created();
+      },
+    );
+    expect(response.status).toBe(201);
+    expect(seen).toBeUndefined();
+  });
+
+  it("transactional mode: ctx.tx runs inside a transaction that commits with the handler", async () => {
+    const key = freshKey();
+    const id = `order-${key}`;
+    const response = await engine.handle(
+      req(key, { body: "{}" }),
+      TX_ROUTE,
+      async (_request, ctx) => {
+        if (ctx.tx === undefined) {
+          throw new Error("ctx.tx missing");
+        }
+        // The transaction is the lease: no renew in this mode (not even a stub).
+        expect("renew" in ctx).toBe(false);
+        expect(ctx.renew).toBeUndefined();
+        await ctx.tx.query(`INSERT INTO "${schema}".orders (id) VALUES ($1)`, [
+          id,
+        ]);
+        const shown = await ctx.tx.query<{ lock_timeout: string }>(
+          "SHOW lock_timeout",
+        );
+        expect(shown.rows[0]?.lock_timeout).toBe("250ms");
+        // Not yet committed: another connection cannot see it.
+        expect(await orderRow(id)).toBe(0);
+        return created();
+      },
+    );
+    expect(response.status).toBe(201);
+    expect(await orderRow(id)).toBe(1);
+    expect(await record(key)).toMatchObject({ state: "completed" });
+  });
+
+  it("transactional mode: the handler's transaction is the only connection ever taken", async () => {
+    // One connection in the pool, held by the handler's transaction: anything else the
+    // engine tried to do through the pool while the handler runs would wait forever.
+    const single = new pg.Pool({ connectionString: url, max: 1 });
+    single.on("error", () => {});
+    try {
+      const singleEngine = createEngine(
+        resolveConfig<Request>({
+          store: postgresStore({ pool: single, schema }),
+          scope: (request) => request.headers.get("x-principal") ?? undefined,
+          secret: SECRET,
+          docsUrl: DOCS,
+          logger,
+        }),
+      );
+      const key = freshKey();
+      const id = `order-${key}`;
+      let inside: { total: number; idle: number; waiting: number } | undefined;
+      const response = await Promise.race([
+        singleEngine.handle(
+          req(key, { body: "{}" }),
+          TX_ROUTE,
+          async (_request, ctx) => {
+            expect(ctx.renew).toBeUndefined();
+            await ctx.tx?.query(
+              `INSERT INTO "${schema}".orders (id) VALUES ($1)`,
+              [id],
+            );
+            inside = {
+              total: single.totalCount,
+              idle: single.idleCount,
+              waiting: single.waitingCount,
+            };
+            return created();
+          },
+        ),
+        sleep(3_000).then(() => {
+          throw new Error("handle() hung on the one-connection pool");
+        }),
+      ]);
+      expect(inside).toEqual({ total: 1, idle: 0, waiting: 0 });
+      expect(response.status).toBe(201);
+      expect(await record(key)).toMatchObject({ state: "completed" });
+    } finally {
+      await single.end();
+    }
+  });
+
+  it("transactional mode: a throw rolls the handler's writes back", async () => {
+    const key = freshKey();
+    const id = `order-${key}`;
+    const mark = logs.length;
+    let hadTx = false;
+    const response = await engine.handle(
+      req(key, { body: "{}" }),
+      TX_ROUTE,
+      async (_request, ctx) => {
+        hadTx = ctx.tx !== undefined;
+        await ctx.tx?.query(`INSERT INTO "${schema}".orders (id) VALUES ($1)`, [
+          id,
+        ]);
+        throw new Error("after writing");
+      },
+    );
+    expect(response.status).toBe(500);
+    expect(hadTx).toBe(true);
+    expect(await orderRow(id)).toBe(0);
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({ row: 12 }),
+      }),
+    ]);
+  });
+});
+
 describe("route validation", () => {
   it("rejects an invalid route template and non-boolean flags on first use", async () => {
     for (const [route, code] of [
       [{ routeTemplate: "orders" }, "ROUTE_TEMPLATE_INVALID"],
+      [{ routeTemplate: "/orders", mode: "tx" }, "ROUTE_MODE_INVALID"],
       [{ routeTemplate: "" }, "ROUTE_TEMPLATE_INVALID"],
       [{ routeTemplate: "/a b" }, "ROUTE_TEMPLATE_INVALID"],
       [{ routeTemplate: "/orders", failOpen: "yes" }, "ROUTE_FLAG_INVALID"],

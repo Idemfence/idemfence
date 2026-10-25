@@ -1,4 +1,4 @@
-import type { Store } from "./store.js";
+import type { Store, TransactionalStore } from "./store.js";
 
 /**
  * Stable codes for {@link IdemfenceConfigError}:
@@ -30,6 +30,11 @@ import type { Store } from "./store.js";
  * - `ROUTE_METHODS_INVALID`: a fetch route's `methods` is not a non-empty array of HTTP
  *   method tokens.
  * - `WEBCRYPTO_MISSING`: `globalThis.crypto.subtle` is not available in this runtime.
+ * - `LOCK_TIMEOUT_INVALID`: a store's or transaction's `lockTimeout` is not a valid duration
+ *   of at most 2147483647 milliseconds (the Postgres `lock_timeout` maximum).
+ * - `ROUTE_MODE_INVALID`: a route's `mode` is not `"lease"` or `"transactional"`.
+ * - `MODE_UNSUPPORTED`: a route uses `mode: "transactional"` but the configured store has no
+ *   `transaction` function.
  */
 export type IdemfenceConfigErrorCode =
   | "STORE_INVALID"
@@ -49,7 +54,10 @@ export type IdemfenceConfigErrorCode =
   | "ROUTE_TEMPLATE_INVALID"
   | "ROUTE_FLAG_INVALID"
   | "ROUTE_METHODS_INVALID"
-  | "WEBCRYPTO_MISSING";
+  | "WEBCRYPTO_MISSING"
+  | "LOCK_TIMEOUT_INVALID"
+  | "ROUTE_MODE_INVALID"
+  | "MODE_UNSUPPORTED";
 
 /** Thrown at construction when idemfence options are invalid. Messages never include secrets. */
 export class IdemfenceConfigError extends Error {
@@ -63,6 +71,14 @@ export class IdemfenceConfigError extends Error {
 }
 
 export type KeySyntax = "sf-string" | "sf-string-or-raw";
+
+/**
+ * How a route's record is written (docs/contract.md section 7). `"lease"` claims the record
+ * with a lease and a fencing token. `"transactional"` runs the handler inside one of the
+ * store's transactions, exposed to it as `ctx.tx`; the store must implement
+ * `transaction()`.
+ */
+export type RouteMode = "lease" | "transactional";
 
 /** Positive integer milliseconds, or a string such as `"30s"` (units: ms, s, m, h, d). */
 export type Duration = number | `${number}${"ms" | "s" | "m" | "h" | "d"}`;
@@ -151,10 +167,13 @@ export interface RouteConfig {
   allowSetCookieReplay?: boolean;
   /** Run the handler without idempotency when the store is unavailable (row 14); default false. */
   failOpen?: boolean;
+  /** `"lease"` (default) or `"transactional"`; see {@link RouteMode}. */
+  mode?: RouteMode;
 }
 
 export interface ResolvedRoute {
   readonly routeTemplate: string;
+  readonly mode: RouteMode;
   readonly required: boolean;
   readonly keySyntax: KeySyntax;
   readonly keyMaxLength: number;
@@ -177,6 +196,9 @@ const runtime = globalThis as unknown as {
 };
 
 const MIN_SECRET_BYTES = 32;
+const DEFAULT_LOCK_TIMEOUT = "250ms";
+// Postgres lock_timeout is a 32-bit signed integer number of milliseconds.
+const MAX_LOCK_TIMEOUT_MS = 2_147_483_647;
 const DURATION_PATTERN = /^(\d+)(ms|s|m|h|d)$/;
 const UNIT_MS = {
   ms: 1,
@@ -322,6 +344,7 @@ export function resolveRoute<TRequest>(
   }
   return Object.freeze({
     routeTemplate: template,
+    mode: routeMode(config.store, route.mode),
     required: booleanOption(
       "required",
       "REQUIRED_INVALID",
@@ -372,6 +395,46 @@ export function resolveRoute<TRequest>(
       false,
     ),
   });
+}
+
+/**
+ * Validates a `lockTimeout` option (default 250 ms) and returns it in milliseconds; throws
+ * `LOCK_TIMEOUT_INVALID`. Used by stores that open transactions.
+ */
+export function lockTimeoutMs(value: unknown): number {
+  let ms: number | undefined;
+  try {
+    ms = parseDuration("lockTimeout", value ?? DEFAULT_LOCK_TIMEOUT);
+  } catch {
+    ms = undefined;
+  }
+  if (ms === undefined || ms > MAX_LOCK_TIMEOUT_MS) {
+    throw new IdemfenceConfigError(
+      "LOCK_TIMEOUT_INVALID",
+      `Option \`lockTimeout\` must be a positive integer number of milliseconds (at most ${MAX_LOCK_TIMEOUT_MS}) or a string such as "250ms" (units: ms, s, m, h, d).`,
+    );
+  }
+  return ms;
+}
+
+function routeMode(store: Store, value: unknown): RouteMode {
+  const resolved = value ?? "lease";
+  if (resolved !== "lease" && resolved !== "transactional") {
+    throw new IdemfenceConfigError(
+      "ROUTE_MODE_INVALID",
+      'Route option `mode` must be "lease" or "transactional".',
+    );
+  }
+  if (
+    resolved === "transactional" &&
+    typeof (store as Partial<TransactionalStore>).transaction !== "function"
+  ) {
+    throw new IdemfenceConfigError(
+      "MODE_UNSUPPORTED",
+      'Route option `mode: "transactional"` requires a store with a transaction function, such as idemfence/postgres.',
+    );
+  }
+  return resolved;
 }
 
 function keyMaxLength(value: unknown): number {

@@ -2,7 +2,12 @@ import { IdemfenceConfigError, type RouteConfig } from "./config.js";
 import { type Handler, isBodyTooLargeResponse } from "./engine.js";
 import type { Idemfence } from "./index.js";
 
-export type { Handler, HandlerContext } from "./engine.js";
+export type {
+  Handler,
+  HandlerContext,
+  LeaseHandlerContext,
+  TransactionalHandlerContext,
+} from "./engine.js";
 export type { Idemfence } from "./index.js";
 
 /** A route for the fetch adapter: the engine's route options plus the methods it enforces. */

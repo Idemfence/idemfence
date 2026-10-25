@@ -7,6 +7,7 @@ import {
   type LogFields,
   type Logger,
   type RouteConfig,
+  type RouteMode,
   resolveConfig,
 } from "./config.js";
 import {
@@ -14,14 +15,19 @@ import {
   type Handler,
   type HandlerContext,
   IdemfenceFencedError,
+  type LeaseHandlerContext,
+  type TransactionalHandlerContext,
 } from "./engine.js";
 
 export {
   type BeginResult,
   IdemfenceStoreError,
   type IdemfenceStoreErrorCode,
+  type SqlExecutor,
+  type SqlResult,
   type Store,
   type StoredResponse,
+  type TransactionalStore,
 } from "./store.js";
 export type {
   Duration,
@@ -30,9 +36,12 @@ export type {
   IdemfenceConfigErrorCode,
   IdemfenceOptions,
   KeySyntax,
+  LeaseHandlerContext,
   LogFields,
   Logger,
   RouteConfig,
+  RouteMode,
+  TransactionalHandlerContext,
 };
 export { IdemfenceConfigError, IdemfenceFencedError };
 
