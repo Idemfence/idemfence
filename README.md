@@ -146,8 +146,8 @@ A handler that calls another service on the request's behalf needs its own idemp
 for that call, one that is the same on every attempt of the same request. Otherwise a retry
 that runs the handler again (after a throw in transactional mode, a release status, a lease
 takeover, or a fail-open run) would repeat the downstream side effect. `ctx.deriveKey(label)`
-returns that key: 64 lowercase hex characters, an HMAC-SHA256 of the request's lookup key
-and the label ([contract](https://github.com/idemfence/idemfence/blob/main/docs/contract.md)
+returns that key: 64 lowercase hex characters, an HMAC-SHA256 of the request's lookup key,
+its fingerprint and the label ([contract](https://github.com/idemfence/idemfence/blob/main/docs/contract.md)
 section 5, with test vectors in Appendix A).
 
 For example, with a payment provider that accepts an `Idempotency-Key` header (Stripe is
@@ -177,14 +177,11 @@ const charge = idempotent(idem, { routeTemplate: "/orders/:id/pay" }, async (req
   not enforce) has nothing to derive from: `ctx.deriveKey` is still there, but rejects with
   code `DERIVE_KEY_UNAVAILABLE`.
 - Derived keys never appear in idemfence's logs or in the problem responses it generates.
-- The key depends on the client's `Idempotency-Key` (through the lookup key), not on the
-  request body. A reused key with a different payload is normally rejected with a 422 before
-  your handler runs, but two cases still reach it: a key reused after `retention`, and a
-  fail-open run, where the store (and with it the payload check) is bypassed. The
-  downstream service then sees the same key with different parameters. Some providers
-  reject that; others return the earlier result. If that matters, keep the downstream
-  service's retention no longer than yours, or check the downstream response against the
-  current request.
+- The key depends on the client's `Idempotency-Key` (through the lookup key) and on the
+  request fingerprint, so a reused key with a different payload derives a different
+  downstream key, including when it reaches your handler after `retention` or on a
+  fail-open run. Changing the fingerprint's configuration (`headerAllowlist`) changes the
+  derived keys of requests whose attempts straddle the change.
 
 **Secrets and rotation.** `secret` is the current secret and `previousSecrets` the earlier
 ones, newest first and oldest last. Derived keys use the oldest configured secret: the last

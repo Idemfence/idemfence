@@ -32,31 +32,46 @@ const DOCS = "https://example.com/docs/idempotency";
 const VECTOR_SECRET = "idemfence-derive-test-vector-secret-0123456789";
 const L1 = "20a9b317bd9314b4fe75ed1ca5b16184ee9ef404bd0ba1e92530fcfd6f3a9b61";
 const L2 = "9cf6d67825a4d64a64c4d609427cfed8482e4adb8be186740cbda0d6e3122848";
+// F1: POST /orders, no Content-Type, empty body. F2: the same with application/json and
+// {"amount":100}.
+const F1 = "7045f9603f3fb5cf7d8ce97d45b3c3e7ca1e3e8cb9623e156f86d94813e932dc";
+const F2 = "05ded99e6efe8a94840e845b018f6ebe152ad66a8d145e7fd5eaad295107bd82";
 const LONG_LABEL = `!${"x".repeat(126)}~`;
 const VECTORS = [
   {
     id: "D1",
     lookup: L1,
+    fingerprint: F2,
     label: "payment-charge",
-    key: "c06b117ddfd327dc94cb2db75791895cabee3ee5e6e85a6d290cda873dd5c805",
+    key: "5c4506931e708c38d7bef30e74e0f38007b0714c0b2b3cc6f473ba6b64ac0ee7",
   },
   {
     id: "D2",
     lookup: L1,
+    fingerprint: F2,
     label: "payment-refund",
-    key: "06e2b2369046aa0f4017bcdcbc48cc467c16002e7e72f6b06633e042423f0ed8",
+    key: "d3aa3e83f254051f0cb1a828d90767072d27093ffcf03f568d2434b17a0cade3",
   },
   {
     id: "D3",
     lookup: L1,
+    fingerprint: F2,
     label: LONG_LABEL,
-    key: "cdd7f794ac16ccf248d9432ae9caba4232c031d0360250a19f2ab142b0986a3e",
+    key: "64dc19a51c383cd1d600efaa600c81b80b8080fcb7a7a3330bbe812c0823bcf4",
   },
   {
     id: "D4",
     lookup: L2,
+    fingerprint: F2,
     label: "payment-charge",
-    key: "306f9287aa19352006b682010b37ccf8a4e74a02da4402aa67d4969d6a09328f",
+    key: "ee7a293c0f9eebc17cd16065abc93f5c6369b30e7d444f1495d1b92c61414242",
+  },
+  {
+    id: "D5",
+    lookup: L1,
+    fingerprint: F1,
+    label: "payment-charge",
+    key: "c7f4764e82e5631f136dc76f5fc3e5a28b56b61dca21353754a3325ec3ba9df5",
   },
 ] as const;
 
@@ -140,6 +155,11 @@ beforeAll(async () => {
     const route = routes.get(c.req.param("name"));
     return route === undefined ? c.notFound() : route(c.req.raw);
   });
+  // The fingerprint covers the path, so the Appendix A requests need POST /orders itself.
+  app.post("/orders", (c) => {
+    const route = routes.get("orders");
+    return route === undefined ? c.notFound() : route(c.req.raw);
+  });
   await new Promise<void>((resolve) => {
     server = serve(
       { fetch: app.fetch, port: 0, hostname: "127.0.0.1" },
@@ -157,8 +177,30 @@ afterAll(async () => {
   await Promise.all(pools.map((p) => p.end()));
 });
 
+/**
+ * The request as the adapter sees it behind a proxy that maps `/r/<name>` to `path`. The
+ * fingerprint covers the path, so mounts sharing a route template must also share the path
+ * for their requests to be the same request.
+ */
+async function atPath(request: Request, path: string): Promise<Request> {
+  const url = new URL(request.url);
+  if (url.pathname === path) {
+    return request;
+  }
+  url.pathname = path;
+  const body = request.body === null ? null : await request.arrayBuffer();
+  return new Request(url, {
+    method: request.method,
+    headers: request.headers,
+    ...(body === null ? {} : { body }),
+  });
+}
+
 let routeCounter = 0;
-/** Mounts `handler` and returns its path; the route template is `route`'s or the path. */
+/**
+ * Mounts `handler` and returns the path to send to. The route template is `route`'s or that
+ * path, and the adapter sees every request at the route template's path.
+ */
 function mount(
   idem: Idemfence,
   handler: Handler,
@@ -166,13 +208,14 @@ function mount(
 ): string {
   routeCounter += 1;
   const name = `t${routeCounter}`;
-  routes.set(
-    name,
-    idempotent(
-      idem,
-      { routeTemplate: `/r/${name}`, ...route } as FetchRouteConfig,
-      handler,
-    ),
+  const routeTemplate = route.routeTemplate ?? `/r/${name}`;
+  const wrapped = idempotent(
+    idem,
+    { ...route, routeTemplate } as FetchRouteConfig,
+    handler,
+  );
+  routes.set(name, async (request) =>
+    wrapped(await atPath(request, routeTemplate)),
   );
   return `/r/${name}`;
 }
@@ -183,7 +226,8 @@ interface Send {
   key?: string | undefined;
   principal?: string;
   method?: string;
-  body?: string;
+  /** A JSON body sent with `Content-Type: application/json`; null sends neither. */
+  body?: string | null;
 }
 
 async function send(
@@ -194,13 +238,14 @@ async function send(
   if (key !== undefined) {
     headers["idempotency-key"] = `"${key}"`;
   }
-  if (method !== "GET") {
+  const withBody = method !== "GET" && body !== null;
+  if (withBody) {
     headers["content-type"] = "application/json";
   }
   const response = await fetch(`${base}${path}`, {
     method,
     headers,
-    ...(method === "GET" ? {} : { body }),
+    ...(withBody ? { body } : {}),
   });
   return {
     status: response.status,
@@ -244,34 +289,51 @@ function deferred<T = void>() {
 const fromHex = (hex: string) => new Uint8Array(Buffer.from(hex, "hex"));
 
 describe("contract Appendix A: derived downstream keys", () => {
-  it("reproduces D1 to D4 byte for byte", async () => {
+  it("reproduces D1 to D5 byte for byte", async () => {
     const hmac = await deriveHmacKey(new TextEncoder().encode(VECTOR_SECRET));
     for (const vector of VECTORS) {
       expect(
-        await derivedKey(hmac, fromHex(vector.lookup), vector.label),
+        await derivedKey(
+          hmac,
+          fromHex(vector.lookup),
+          fromHex(vector.fingerprint),
+          vector.label,
+        ),
         vector.id,
       ).toBe(vector.key);
     }
   });
 
-  it("reproduces D1 to D3 through ctx.deriveKey for the L1 request", async () => {
+  it("reproduces D1 to D3 (F2 request) and D5 (F1 request) through ctx.deriveKey for the L1 key", async () => {
     // L1: principal user-1, POST, route template /orders, client key 8e03978e-....
+    let labels: string[] = [];
     const seen: string[] = [];
-    const path = mount(
-      idemfence(),
-      async (_request, ctx) => {
-        for (const vector of VECTORS.slice(0, 3)) {
-          seen.push(await derive(ctx, vector.label));
-        }
-        return new Response("later", { status: 429 });
-      },
-      { routeTemplate: "/orders" },
+    routes.set(
+      "orders",
+      idempotent(
+        idemfence(),
+        { routeTemplate: "/orders" },
+        async (_request, ctx) => {
+          for (const label of labels) {
+            seen.push(await derive(ctx, label));
+          }
+          // A release status leaves no record, so the F1 request runs too.
+          return new Response("later", { status: 429 });
+        },
+      ),
     );
+    const key = "8e03978e-40d5-43e8-bc93-6894a57f9324";
+    labels = VECTORS.slice(0, 3).map((vector) => vector.label);
     expect(
-      (await send(path, { key: "8e03978e-40d5-43e8-bc93-6894a57f9324" }))
-        .status,
+      (await send("/orders", { key, body: '{"amount":100}' })).status,
     ).toBe(429);
-    expect(seen).toEqual(VECTORS.slice(0, 3).map((vector) => vector.key));
+    labels = ["payment-charge"];
+    expect((await send("/orders", { key, body: null })).status).toBe(429);
+    expect(seen).toEqual(
+      ["D1", "D2", "D3", "D5"].map(
+        (id) => VECTORS.find((vector) => vector.id === id)?.key,
+      ),
+    );
     // And the lookup key really is L1.
     expect(
       Buffer.from(
@@ -412,6 +474,102 @@ describe("every attempt of the same request derives the same key", () => {
     expect((await send(normal, { key })).status).toBe(201);
     expect(seen.failOpen).toHaveLength(1);
     expect(seen.normal).toEqual(seen.failOpen);
+  });
+});
+
+describe("the request fingerprint is part of the key", () => {
+  it("row 10: after retention, the same body derives the same key and a different body a different key", async () => {
+    const seen: string[] = [];
+    const path = mount(
+      idemfence({ lease: "100ms", retention: "500ms" }),
+      async (_request, ctx) => {
+        seen.push(await derive(ctx, "payment-charge"));
+        return Response.json({ run: seen.length }, { status: 201 });
+      },
+    );
+    const key = freshKey();
+    const lookup = Buffer.from(
+      await lookupKey({
+        namespace: "idemfence",
+        principal: "user-1",
+        method: "POST",
+        routeTemplate: path,
+        clientKey: key,
+      }),
+    );
+    // Wait on the store's clock, not ours, until the record is past retention.
+    const pastRetention = async () => {
+      const deadline = Date.now() + 5_000;
+      for (;;) {
+        const result = await pool.query<{ expired: boolean }>(
+          `SELECT expires_at <= clock_timestamp() AS expired FROM ${records}
+           WHERE lookup_key = $1`,
+          [lookup],
+        );
+        if (result.rows[0]?.expired === true) {
+          return;
+        }
+        if (Date.now() > deadline) {
+          throw new Error("the record did not pass retention within 5 s");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+
+    expect((await send(path, { key, body: '{"amount":100}' })).status).toBe(
+      201,
+    );
+    await pastRetention();
+    const again = await send(path, { key, body: '{"amount":100}' });
+    expect(again.status).toBe(201);
+    expect(again.headers.get("idempotent-replayed")).toBeNull();
+    await pastRetention();
+    const changed = await send(path, { key, body: '{"amount":250}' });
+    expect(changed.status).toBe(201);
+    expect(changed.headers.get("idempotent-replayed")).toBeNull();
+
+    expect(seen).toHaveLength(3);
+    expect(seen[1]).toBe(seen[0]);
+    expect(seen[2]).not.toBe(seen[0]);
+  });
+
+  it("fail-open: the same key with a different body derives a different key from the normal run", async () => {
+    const routeTemplate = `/payload-${randomBytes(4).toString("hex")}`;
+    const seen: { failOpen: string[]; normal: string[] } = {
+      failOpen: [],
+      normal: [],
+    };
+    const normal = mount(
+      idemfence(),
+      async (_request, ctx) => {
+        seen.normal.push(await derive(ctx, "payment-charge"));
+        return Response.json({ ok: true }, { status: 201 });
+      },
+      { routeTemplate },
+    );
+    const failOpen = mount(
+      idemfence({ store: postgresStore({ pool: deadPool }) }),
+      async (_request, ctx) => {
+        seen.failOpen.push(await derive(ctx, "payment-charge"));
+        return Response.json({ ok: true }, { status: 201 });
+      },
+      { routeTemplate, failOpen: true },
+    );
+    const key = freshKey();
+    expect((await send(normal, { key, body: '{"amount":100}' })).status).toBe(
+      201,
+    );
+    // With the store down nothing checks the payload, so the handler runs.
+    expect((await send(failOpen, { key, body: '{"amount":250}' })).status).toBe(
+      201,
+    );
+    expect((await send(failOpen, { key, body: '{"amount":100}' })).status).toBe(
+      201,
+    );
+    expect(seen.normal).toHaveLength(1);
+    expect(seen.failOpen).toHaveLength(2);
+    expect(seen.failOpen[0]).not.toBe(seen.normal[0]);
+    expect(seen.failOpen[1]).toBe(seen.normal[0]);
   });
 });
 

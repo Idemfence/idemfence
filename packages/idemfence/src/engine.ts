@@ -59,9 +59,10 @@ export class IdemfenceDeriveError extends Error {
 /**
  * Derives a downstream idempotency key for a call this request makes to another service,
  * such as a payment provider (docs/contract.md section 5). The key depends only on the
- * request's lookup key, the label and the oldest configured secret, so every attempt of the
- * same request (a retry after a throw or a release, a lease takeover, a fail-open run)
- * derives the same value. Resolves to 64 lowercase hex characters.
+ * request's lookup key, its fingerprint, the label and the oldest configured secret, so
+ * every attempt of the same request (a retry after a throw or a release, a lease takeover,
+ * a fail-open run) derives the same value, and a reused key with a different payload
+ * derives a different one. Resolves to 64 lowercase hex characters.
  *
  * `label` names the downstream call and must be 1 to 128 printable ASCII characters
  * (0x21 to 0x7E); anything else rejects with {@link IdemfenceDeriveError} code
@@ -220,8 +221,13 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
   // The HMAC key for derived keys is imported once, from the oldest secret (the last entry
   // of previousSecrets, which is newest first): rotating a new secret in moves the old one
   // to the front of previousSecrets and changes no derived key.
+  // The fingerprint is the one already computed for the request (row 15), so a reused key
+  // with a different payload derives a different key.
   let hmacKey: Promise<CryptoKey> | undefined;
-  function deriveFor(lookup: Uint8Array): DeriveKey {
+  function deriveFor(
+    lookup: Uint8Array,
+    requestFingerprint: Uint8Array,
+  ): DeriveKey {
     return async (label) => {
       checkLabel(label);
       hmacKey ??= deriveHmacKey(
@@ -230,7 +236,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
         hmacKey = undefined;
         throw error;
       });
-      return derivedKey(await hmacKey, lookup, label);
+      return derivedKey(await hmacKey, lookup, requestFingerprint, label);
     };
   }
 
@@ -351,7 +357,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
         // The lookup key is known, so downstream calls still deduplicate.
         return handler(request, {
           async renew() {},
-          deriveKey: deriveFor(key),
+          deriveKey: deriveFor(key, printed.fingerprint),
         });
       }
       return storeUnavailable(
@@ -373,6 +379,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       keyHash,
       begun.fencingToken,
       begun.attempts,
+      deriveFor(key, printed.fingerprint),
     );
   }
 
@@ -490,7 +497,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     try {
       response = await handler(request, {
         tx: transaction.executor,
-        deriveKey: deriveFor(key),
+        deriveKey: deriveFor(key, requestFingerprint),
       });
     } catch (error) {
       return threw(error);
@@ -617,6 +624,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     keyHash: string,
     fencingToken: bigint,
     attempts: number,
+    deriveKey: DeriveKey,
   ): Promise<Response> {
     const row = attempts > 1 ? 9 : 5;
     const ctx: LeaseHandlerContext = {
@@ -625,7 +633,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
           throw new IdemfenceFencedError();
         }
       },
-      deriveKey: deriveFor(key),
+      deriveKey,
     };
 
     let outcome: HandlerOutcome;

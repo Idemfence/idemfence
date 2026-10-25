@@ -53,18 +53,19 @@ export function deriveHmacKey(secret: Uint8Array): Promise<CryptoKey> {
 
 /**
  * A derived downstream key (docs/contract.md section 5): lowercase hex of HMAC-SHA256 over
- * the length-prefixed domain tag, lookup key and label.
+ * the length-prefixed domain tag, lookup key, request fingerprint and label.
  */
 export async function derivedKey(
   hmacKey: CryptoKey,
   lookup: Uint8Array,
+  requestFingerprint: Uint8Array,
   label: string,
 ): Promise<string> {
   const mac = new Uint8Array(
     await globalThis.crypto.subtle.sign(
       "HMAC",
       hmacKey,
-      encode([DERIVE_TAG, lookup, label]),
+      encode([DERIVE_TAG, lookup, requestFingerprint, label]),
     ),
   );
   return Array.from(mac, (byte) => byte.toString(16).padStart(2, "0")).join("");

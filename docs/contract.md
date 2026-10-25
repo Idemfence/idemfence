@@ -212,10 +212,11 @@ of the same request (item 1). idemfence derives it from the lookup key:
 
 ```
 derived key = lowercase hex( HMAC-SHA256( K, enc("idemfence/derive/v1") || enc(lookup key)
-                                             || enc(label) ) )
+                                             || enc(fingerprint) || enc(label) ) )
 ```
 
-- `lookup key` is the 32 bytes of section 2, item 6. `label` names the downstream call and
+- `lookup key` is the 32 bytes of section 2, item 6, and `fingerprint` the 32-byte request
+  fingerprint of section 3, as computed for the request. `label` names the downstream call and
   is 1 to 128 characters, each 0x21 to 0x7E, encoded as UTF-8. Any other label MUST be
   rejected. A request without a key has no lookup key, so asking for a derived key on it
   MUST fail.
@@ -229,11 +230,11 @@ derived key = lowercase hex( HMAC-SHA256( K, enc("idemfence/derive/v1") || enc(l
 - Every attempt of the same request derives the same key: a retry after a throw or a release
   status, a lease takeover (row 9), and a fail-open run (row 14), where the lookup key is
   known even though the store is bypassed.
-- The derived key depends on the lookup key, not on the request fingerprint. A different
-  request with the same lookup key normally never reaches the handler (row 7), but two
-  cases do derive the same key for a different payload: a key reused after retention
-  (row 10), and a fail-open run (row 14), where no fingerprint check takes place. The
-  downstream service then sees a reused key with different parameters.
+- The derived key depends on the lookup key and the fingerprint, so a reused key with a
+  different payload derives a different key, including after retention (row 10) and on a
+  fail-open run (row 14), where no fingerprint check takes place. Changing a configurable
+  input of the fingerprint (the header allowlist, section 3, item 5) changes the derived
+  keys of requests whose attempts straddle the change.
 - Derived keys MUST NOT appear in log entries (section 8) or in any response or problem body
   that idemfence itself generates.
 - The tag, the encoding and the choice of `K` are observable behaviour (section 9). Test
@@ -384,21 +385,24 @@ Notes:
 ### Derived downstream keys
 
 In every vector, `K` (the oldest configured secret) is the 46 UTF-8 bytes of
-`idemfence-derive-test-vector-secret-0123456789`. The lookup keys are those of L1 and L2.
+`idemfence-derive-test-vector-secret-0123456789`. The lookup keys are those of L1 and L2,
+and the fingerprints those of F1 and F2.
 
-| #  | lookup key | label | derived key |
-| -- | ---------- | ----- | ----------- |
-| D1 | L1 | `payment-charge` | `c06b117ddfd327dc94cb2db75791895cabee3ee5e6e85a6d290cda873dd5c805` |
-| D2 | L1 | `payment-refund` | `06e2b2369046aa0f4017bcdcbc48cc467c16002e7e72f6b06633e042423f0ed8` |
-| D3 | L1 | `!`, then 126 × `x`, then `~` (128 characters) | `cdd7f794ac16ccf248d9432ae9caba4232c031d0360250a19f2ab142b0986a3e` |
-| D4 | L2 | `payment-charge` | `306f9287aa19352006b682010b37ccf8a4e74a02da4402aa67d4969d6a09328f` |
+| #  | lookup key | fingerprint | label | derived key |
+| -- | ---------- | ----------- | ----- | ----------- |
+| D1 | L1 | F2 | `payment-charge` | `5c4506931e708c38d7bef30e74e0f38007b0714c0b2b3cc6f473ba6b64ac0ee7` |
+| D2 | L1 | F2 | `payment-refund` | `d3aa3e83f254051f0cb1a828d90767072d27093ffcf03f568d2434b17a0cade3` |
+| D3 | L1 | F2 | `!`, then 126 × `x`, then `~` (128 characters) | `64dc19a51c383cd1d600efaa600c81b80b8080fcb7a7a3330bbe812c0823bcf4` |
+| D4 | L2 | F2 | `payment-charge` | `ee7a293c0f9eebc17cd16065abc93f5c6369b30e7d444f1495d1b92c61414242` |
+| D5 | L1 | F1 | `payment-charge` | `c7f4764e82e5631f136dc76f5fc3e5a28b56b61dca21353754a3325ec3ba9df5` |
 
 Notes:
 
-- D1 and D2 share a lookup key and differ only in the label.
-- D3 is the longest allowed label and starts and ends with the lowest (0x21) and highest
-  (0x7E) allowed characters.
-- D1 and D4 share a label and differ only in the lookup key.
+- D1 and D2 differ only in the label.
+- D3 differs from D1 only in the label: the longest allowed one, starting and ending with
+  the lowest (0x21) and highest (0x7E) allowed characters.
+- D4 differs from D1 only in the lookup key.
+- D5 differs from D1 only in the fingerprint.
 
 ## References
 
