@@ -16,10 +16,27 @@ idemfence-conformance --url http://127.0.0.1:3000 --config target.json [--json] 
 | `--json` | Machine-readable output: `{ url, results, summary }`. |
 | `--require-all` | A scenario that was not run (missing fixture) counts as a failure. |
 | `--only` | Comma-separated contract row numbers to run; the rest are reported as skipped. |
+| `--group` | `contract` (default) or `concurrency`. |
+| `--iterations` | Concurrency group: number of bursts (default 1000). |
+| `--concurrency` | Concurrency group: requests per burst (default 50). |
 
 Exit status is 0 only when no scenario failed and, with `--require-all`, none was not run.
 Rows 9, 13 and 14 are not testable black-box and are reported as such; they never fail and
 are not counted by `--require-all`.
+
+## The Concurrency group
+
+`--group concurrency` fires `--iterations` bursts (default 1000) of `--concurrency` identical
+requests (default 50) at the `slow` fixture, each burst with a fresh key. Every connection is
+opened and the request head sent first; then every body is released together, each after a
+random 0–5 ms jitter. The handler's duration alternates per burst: the `slow` fixture's
+`workField` (default `simulateWorkMs`) is set to a random 0–20 ms, so some requests arrive
+while the first is in flight and some after it completed. For each burst the suite asserts
+that `count` rose by exactly 1; exactly one response is a non-replayed 2xx; every other
+response is a 409 in-flight problem with an integer `Retry-After` or a byte-identical replay
+with `Idempotent-Replayed: true`; and there is no 5xx and no connection error. A failing
+burst is reported with its iteration number, key prefix, status histogram and count delta.
+Connections are kept alive across bursts so a long run does not exhaust local ports.
 
 ## Side effects
 
@@ -74,7 +91,7 @@ Every fixture except `count` and `noPrincipal` has `method`, `path` and an optio
 | ------- | ------------ | ------------ |
 | `create` | 2, 3, 5, 6, 7, 15 | `alternateBody`: a different payload with the same key (row 7). |
 | `count` | all rows that check side effects | `path` only; `GET` must return `{ "count": n }`. |
-| `slow` | 8, 16 | `workMs`: how long the handler takes (at least 500). |
+| `slow` | 8, 16, concurrency | `workMs`: how long the handler takes (at least 500). `workField` (optional, default `simulateWorkMs`): the body field the concurrency group sets to a random 0–20 ms. |
 | `release` | 11 | `status`: the release status the route returns (400–599). |
 | `throws` | 12 | none; the handler must throw. |
 | `shortRetention` | 10 | `retentionMs`: the route's retention (at least 100). The suite waits `retentionMs + 600`. |

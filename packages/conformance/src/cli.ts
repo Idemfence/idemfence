@@ -2,8 +2,10 @@
 import { readFile } from "node:fs/promises";
 import {
   ConfigError,
+  formatConcurrency,
   formatHuman,
   parseCliArgs,
+  runConcurrencyGroup,
   runContractGroup,
   summarize,
   USAGE,
@@ -39,8 +41,29 @@ async function main(): Promise<number> {
   }
 
   console.error(
-    `idemfence-conformance: running the Contract group against ${options.url}; every scenario creates real side effects in the target.`,
+    `idemfence-conformance: running the ${options.group === "concurrency" ? "Concurrency" : "Contract"} group against ${options.url}; every scenario creates real side effects in the target.`,
   );
+  if (options.group === "concurrency") {
+    let result: Awaited<ReturnType<typeof runConcurrencyGroup>>;
+    try {
+      result = await runConcurrencyGroup(options.url, config, {
+        iterations: options.iterations,
+        concurrency: options.concurrency,
+      });
+    } catch (error) {
+      console.error(
+        `idemfence-conformance: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return 2;
+    }
+    console.log(
+      options.json
+        ? JSON.stringify({ url: options.url, ...result }, null, 2)
+        : formatConcurrency(options.url, result),
+    );
+    return result.ok ? 0 : 1;
+  }
+
   const results = await runContractGroup(options.url, config, {
     only: options.only,
   });

@@ -165,6 +165,9 @@ jobs:
             || { echo "::error::row 6 did not report a duplicate side effect"; exit 1; }
           echo "non-conforming run exited $status and row 6 reported a duplicate side effect"
 
+      - name: Conformance, Concurrency group (1000 x 50)
+        run: node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config reference-app/conformance.json --group concurrency
+
       - name: Show logs on failure
         if: ${{ failure() }}
         run: docker compose -f reference-app/compose.yaml logs --no-color

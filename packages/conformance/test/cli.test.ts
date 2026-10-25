@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
+  type BurstReply,
   ConfigError,
+  classifyIteration,
   formatHuman,
   KEY_PREFIX,
   newKey,
@@ -36,6 +38,9 @@ describe("parseCliArgs", () => {
       json: true,
       requireAll: true,
       only: [5, 6, 7],
+      group: "contract",
+      iterations: 1000,
+      concurrency: 50,
     });
   });
 
@@ -48,6 +53,29 @@ describe("parseCliArgs", () => {
       json: false,
       requireAll: false,
       only: undefined,
+      group: "contract",
+      iterations: 1000,
+      concurrency: 50,
+    });
+  });
+
+  it("parses the concurrency group options", () => {
+    const parsed = parseCliArgs([
+      "--url",
+      "http://x",
+      "--config",
+      "t.json",
+      "--group",
+      "concurrency",
+      "--iterations",
+      "20",
+      "--concurrency",
+      "8",
+    ]);
+    expect(parsed).toMatchObject({
+      group: "concurrency",
+      iterations: 20,
+      concurrency: 8,
     });
   });
 
@@ -70,6 +98,18 @@ describe("parseCliArgs", () => {
     ],
     [["--url", "http://x", "--config", "t.json", "--bogus"], "Unknown option"],
     [["--url", "http://x", "--config", "t.json", "extra"], "positional"],
+    [
+      ["--url", "http://x", "--config", "t.json", "--group", "stress"],
+      "--group must be",
+    ],
+    [
+      ["--url", "http://x", "--config", "t.json", "--iterations", "0"],
+      "--iterations must be",
+    ],
+    [
+      ["--url", "http://x", "--config", "t.json", "--concurrency", "1"],
+      "--concurrency must be",
+    ],
   ])("rejects %j", (argv, message) => {
     expect(() => parseCliArgs(argv)).toThrow(message);
   });
@@ -327,5 +367,97 @@ describe("the built CLI", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("classifyIteration", () => {
+  const body = Buffer.from('{"id":1}');
+  const ok = (
+    status: number,
+    extra: Record<string, string> = {},
+  ): BurstReply => ({
+    status,
+    headers: { "content-type": "application/json", ...extra },
+    bytes: body,
+  });
+  const replay = (): BurstReply => ok(201, { "idempotent-replayed": "true" });
+  const inFlight = (retryAfter = "1"): BurstReply => ({
+    status: 409,
+    headers: {
+      "content-type": "application/problem+json",
+      link: '<https://d/x#in-flight>; rel="describedby"',
+      "retry-after": retryAfter,
+    },
+    bytes: Buffer.from(
+      JSON.stringify({
+        type: "https://d/x#in-flight",
+        title: "t",
+        status: 409,
+        detail: "d",
+      }),
+    ),
+  });
+
+  it("accepts one winner, replays and valid 409s", () => {
+    const result = classifyIteration(
+      [ok(201), replay(), inFlight(), replay(), inFlight("3")],
+      1,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.histogram).toStrictEqual({
+      "201": 1,
+      "201 replayed": 2,
+      "409": 2,
+    });
+  });
+
+  it.each([
+    ["a duplicate side effect", [ok(201), replay()], 2, "count changed by 2"],
+    [
+      "two winners",
+      [ok(201), ok(201)],
+      1,
+      "exactly one non-replayed 2xx, got 2",
+    ],
+    [
+      "no winner",
+      [replay(), inFlight()],
+      1,
+      "exactly one non-replayed 2xx, got 0",
+    ],
+    [
+      "a 5xx",
+      [ok(201), { status: 503, headers: {}, bytes: Buffer.alloc(0) }],
+      1,
+      "server error 503",
+    ],
+    [
+      "a connection error",
+      [ok(201), { error: "socket hang up" }],
+      1,
+      "1 connection error(s), first: socket hang up",
+    ],
+    [
+      "a 409 without Retry-After",
+      [ok(201), inFlight("")],
+      1,
+      "Retry-After should be a positive integer",
+    ],
+    [
+      "a replay with a different body",
+      [ok(201), { ...replay(), bytes: Buffer.from("other") } as BurstReply],
+      1,
+      "not byte-identical",
+    ],
+    [
+      "an unexpected 4xx",
+      [ok(201), { status: 422, headers: {}, bytes: Buffer.alloc(0) }],
+      1,
+      "unexpected response 422",
+    ],
+  ] as const)("rejects %s", (_name, replies, delta, message) => {
+    const result = classifyIteration([...replies], delta);
+    expect(result.ok).toBe(false);
+    expect(result.messages.join(" ")).toContain(message);
   });
 });
