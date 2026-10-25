@@ -22,7 +22,8 @@ export interface TransactionOptions {
  * Failures of the transaction itself reject with `IdemfenceStoreError` (the driver's error
  * as `cause`): `TRANSACTION_UNAVAILABLE` when no client could be taken or `BEGIN` or
  * `SET LOCAL` failed (nothing ran); `COMMIT_REJECTED` when the server answered `COMMIT`
- * with an error (rolled back for certain); `COMMIT_UNKNOWN` when the connection failed
+ * with an error or with a `ROLLBACK` tag because the transaction was already aborted
+ * (rolled back for certain); `COMMIT_UNKNOWN` when the connection failed
  * during `COMMIT` with no answer from the server (the transaction may have committed).
  *
  * The transaction holds the connection for the whole call: size the pool for the number of
@@ -68,8 +69,9 @@ export async function withTransaction<T>(
       await rollback();
       throw error;
     }
+    let committed: { command?: string };
     try {
-      await client.query("COMMIT");
+      committed = await client.query("COMMIT");
     } catch (error) {
       await rollback();
       // Only an ordinary ERROR answered by a server that is still talking to us proves the
@@ -86,6 +88,14 @@ export async function withTransaction<T>(
             "The connection failed during COMMIT; the transaction may or may not have committed.",
             { cause: error },
           );
+    }
+    // An aborted transaction (a failed statement that fn swallowed) answers COMMIT with a
+    // ROLLBACK tag and no error: nothing was committed.
+    if (committed.command !== "COMMIT") {
+      throw new IdemfenceStoreError(
+        "COMMIT_REJECTED",
+        `COMMIT answered ${committed.command ?? "nothing"}: the transaction was already aborted and has been rolled back.`,
+      );
     }
     return result;
   } finally {

@@ -363,6 +363,24 @@ describe("withTransaction error classification", () => {
     ).toBe(0);
   });
 
+  it("COMMIT_REJECTED when the transaction was already aborted and COMMIT answers ROLLBACK", async () => {
+    // A failed statement that fn swallows leaves the transaction aborted; Postgres then
+    // answers COMMIT with a ROLLBACK tag and no error.
+    await expect(
+      withTransaction(pool, {}, async (tx) => {
+        await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-aborted"]);
+        await tx.query("SELECT 1 / 0").catch(() => undefined);
+        return "looks fine";
+      }),
+    ).rejects.toEqual(
+      expect.objectContaining({
+        name: "IdemfenceStoreError",
+        code: "COMMIT_REJECTED",
+      }),
+    );
+    expect(await visible(key(), "o-aborted")).toMatchObject({ order: 0 });
+  });
+
   it("COMMIT_UNKNOWN when the connection fails during COMMIT (outcome ambiguous)", async () => {
     const own = new pg.Pool({ connectionString: url, max: 1 });
     own.on("error", () => {});
@@ -408,6 +426,39 @@ describe("postgresStore.transaction", () => {
       await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-store-tx"]);
     });
     expect(await visible(k, "o-store-tx")).toEqual({ record: 1, order: 1 });
+  });
+
+  it("a renew that fails inside the transaction does not abort it", async () => {
+    const k = key();
+    const begun = await store.begin(k, fp, 5_000, 60_000);
+    if (begun.outcome !== "acquired") {
+      throw new Error(`unexpected ${begun.outcome}`);
+    }
+    // Another session holds the record's row lock, so the renew UPDATE hits lock_timeout.
+    const locker = new pg.Client({ connectionString: url });
+    await locker.connect();
+    try {
+      await locker.query("BEGIN");
+      await locker.query(
+        `SELECT 1 FROM ${records} WHERE lookup_key = $1 FOR UPDATE`,
+        [Buffer.from(k)],
+      );
+      await withTransaction(pool, {}, async (tx) => {
+        await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, [
+          "o-renew-fail",
+        ]);
+        await expect(
+          store.renew(k, begun.fencingToken, 5_000, tx),
+        ).rejects.toMatchObject({ code: "55P03" });
+        // Still usable: the failed renew was confined to a savepoint.
+        const alive = await tx.query<{ n: number }>("SELECT 1::int AS n");
+        expect(alive.rows[0]?.n).toBe(1);
+      });
+    } finally {
+      await locker.query("ROLLBACK");
+      await locker.end();
+    }
+    expect(await visible(k, "o-renew-fail")).toEqual({ record: 1, order: 1 });
   });
 
   it("accepts the executor on renew, complete, release and purgeExpired", async () => {

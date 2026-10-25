@@ -8,8 +8,9 @@
  *   after the maximum number of attempts.
  * - `TRANSACTION_UNAVAILABLE`: a transaction could not be opened (no connection, or `BEGIN`
  *   or `SET LOCAL` failed); nothing ran. The `cause` is the driver's error.
- * - `COMMIT_REJECTED`: the server answered `COMMIT` with an error, so the transaction was
- *   rolled back for certain. The `cause` is the server's error (SQLSTATE in `cause.code`).
+ * - `COMMIT_REJECTED`: the server answered `COMMIT` with an error, or with a `ROLLBACK` tag
+ *   because the transaction was already aborted, so it was rolled back for certain. For an
+ *   error, the `cause` is the server's error (SQLSTATE in `cause.code`).
  * - `COMMIT_UNKNOWN`: the connection failed during `COMMIT` with no answer from the server,
  *   so the transaction may or may not have committed. The `cause` is the driver's error.
  */
@@ -66,6 +67,8 @@ export interface SqlResult<R> {
   readonly rows: R[];
   /** Rows affected by a statement, or null when the driver does not report it. */
   readonly rowCount: number | null;
+  /** The server's command tag (`COMMIT`, `ROLLBACK`, `UPDATE`, ...) when the driver reports it. */
+  readonly command?: string;
 }
 
 /**

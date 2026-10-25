@@ -860,6 +860,47 @@ describe("row 14: store unavailable", () => {
     ]);
   });
 
+  it("transactional mode: a handler that swallows a failed statement is not stored as a success", async () => {
+    const key = freshKey();
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      mode: "transactional",
+    };
+    const id = `order-${key}`;
+    const mark = logs.length;
+    const response = await engine.handle(
+      req(key, { body: "{}" }),
+      route,
+      async (_request, ctx) => {
+        await ctx.tx?.query(`INSERT INTO "${schema}".orders (id) VALUES ($1)`, [
+          id,
+        ]);
+        await ctx.tx?.query("SELECT 1 / 0").catch(() => undefined);
+        return created();
+      },
+    );
+    // The transaction was aborted, so COMMIT rolled it back: nothing happened.
+    await expectProblem(response, 503, "store-unavailable");
+    expect(
+      (
+        await pool.query(`SELECT id FROM "${schema}".orders WHERE id = $1`, [
+          id,
+        ])
+      ).rowCount,
+    ).toBe(0);
+    expect(await record(key)).toBeUndefined();
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          row: 14,
+          outcome: "store-unavailable",
+          error: expect.objectContaining({ code: "COMMIT_REJECTED" }),
+        }),
+      }),
+    ]);
+  });
+
   it("transactional mode: a connection failure during COMMIT is a 503 that keeps the lease (outcome unknown)", async () => {
     const key = freshKey();
     const route: RouteConfig = {
