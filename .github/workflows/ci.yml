@@ -14,7 +14,7 @@ permissions:
 jobs:
   check:
     name: check (node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +75,7 @@ jobs:
 
   licenses:
     name: licenses
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,7 +98,7 @@ jobs:
 
   audit:
     name: audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -121,7 +121,7 @@ jobs:
 
   reference-app:
     name: reference-app
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -183,7 +183,7 @@ jobs:
   # uploaded tarball and no release is created.
   release-dry-run-build:
     name: release-dry-run-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       publish: ${{ steps.decide.outputs.publish }}
       version: ${{ steps.decide.outputs.version }}
@@ -263,7 +263,7 @@ jobs:
   release-dry-run-stage:
     name: release-dry-run-stage
     needs: release-dry-run-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       TARBALL: ${{ needs.release-dry-run-build.outputs.tarball }}
       SHA256: ${{ needs.release-dry-run-build.outputs.sha256 }}
@@ -293,7 +293,7 @@ jobs:
   release-dry-run-notes:
     name: release-dry-run-notes
     needs: [release-dry-run-build, release-dry-run-stage]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.release-dry-run-build.outputs.version }}
       PUBLISH: ${{ needs.release-dry-run-build.outputs.publish }}
@@ -325,7 +325,7 @@ jobs:
         release-dry-run-stage,
         release-dry-run-notes,
       ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Require every job to succeed
         env:
