@@ -28,7 +28,7 @@ concurrency:
 jobs:
   build:
     name: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
@@ -111,7 +111,7 @@ jobs:
     name: publish
     needs: build
     if: ${{ needs.build.outputs.publish == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: npm-release
     permissions:
       id-token: write
@@ -145,7 +145,7 @@ jobs:
   draft-release:
     name: draft-release
     needs: [build, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:

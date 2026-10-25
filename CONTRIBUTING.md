@@ -76,6 +76,12 @@ exists anywhere. The steps are:
    A version that is staged but not yet approved still reads as "not on npm" (404), so a
    rerun of the workflow for the same version fails at `npm stage publish`; that is expected.
    Approve or reject the pending stage first.
+
+   On pull requests, CI's `release-dry-run-*` jobs mirror these three jobs. The
+   `npm stage publish --dry-run` of the real tarball runs on the version pull request (where
+   `release.yml` would publish); on every other pull request it is skipped by design, because a
+   version that already exists on npm cannot be dry-run staged, while the tarball is still
+   packed, uploaded and verified by sha256.
 4. **The maintainer verifies and approves the staged package on npm.** Before approving:
    run `npm stage download <stage-id>` and compute the tarball's sha256; pack the same commit
    locally from a fresh clone (`pnpm install --frozen-lockfile && pnpm build`, then `pnpm pack`
