@@ -42,11 +42,25 @@ Redis and the Express and Fastify adapters are not released yet.
 A route with `mode: "transactional"` runs its handler inside one of the store's
 transactions and passes it to the handler as `ctx.tx`, a `SqlExecutor`
 (`query(text, params)`, the interface a `pg` `Pool` or `PoolClient` already satisfies).
-Everything the handler writes through `ctx.tx` commits when the handler returns and rolls
-back when it throws. The transaction is the lease, so `ctx.renew` is absent in this mode:
-a lease update inside the uncommitted transaction would be invisible to other sessions and
-would row-lock the record. In lease mode it is the other way round: `ctx.renew()` extends
-the lease and `ctx.tx` is absent.
+The idempotency record is written in that same transaction, so the record and everything
+the handler writes through `ctx.tx` commit or roll back together
+([contract](https://github.com/idemfence/idemfence/blob/main/docs/contract.md) section 7):
+
+- The handler returns a response: idemfence stores it with the record, commits, and only
+  then sends it (store-then-send). A retry replays it.
+- The handler throws: everything rolls back, the client gets a 500 `about:blank` problem,
+  nothing is stored, and a retry runs the handler again (row 13).
+- The handler returns a release status (default 408, 425, 429): everything rolls back and
+  the response is returned as-is, so the key can be retried (row 11).
+- The record cannot be written or the commit fails: everything rolls back (or, if the
+  connection died during `COMMIT`, either everything or nothing landed) and the client gets
+  a 503 store-unavailable with `Retry-After`. The handler's response is never sent in that
+  case, because none of it was committed.
+
+The transaction is the lease, so `ctx.renew` is absent in this mode: a lease update inside
+the uncommitted transaction would be invisible to other sessions and would row-lock the
+record. In lease mode it is the other way round: `ctx.renew()` extends the lease and
+`ctx.tx` is absent.
 
 ```ts
 import { createIdemfence } from "idemfence";
@@ -81,15 +95,47 @@ crashes the process. idemfence handles errors on the client it has checked out f
 transaction and destroys that client instead of returning it to the pool; the pool handler
 covers clients that fail while idle.
 
-The transaction holds one pool connection for the handler's whole duration, so size the
-pool for the number of transactional handlers that may run at once, and set
+Rules for `ctx.tx`:
+
+- Never run `BEGIN`, `COMMIT` or `ROLLBACK` on it: idemfence ends the transaction itself,
+  after storing the response. `SAVEPOINT`, `RELEASE SAVEPOINT` and `ROLLBACK TO SAVEPOINT`
+  are fine.
+- A failed statement aborts the whole transaction even if the handler catches the error;
+  the request is then answered 503 and nothing is committed. Wrap a statement that may fail
+  in a savepoint.
+- It is dead once the transaction ends: a query on it after the response was committed or
+  rolled back rejects at once with `IdemfenceStoreError` code `TRANSACTION_ENDED` and never
+  reaches the pooled connection, which may already serve another request. A response body
+  over `responseBodyCap` is streamed to the client after `COMMIT`, so it must not read from
+  `ctx.tx`.
+- On an optional-key route (`required: false`), a request without a key runs the handler in
+  a plain transaction with no record: committed when the handler returns, rolled back when
+  it throws.
+
+A concurrent request with the same key waits on the first one's uncommitted record for up
+to the store's `lockTimeout` (default 250 ms; an invalid value throws
+`IdemfenceConfigError` with code `LOCK_TIMEOUT_INVALID`), then gets a 409 in-flight with
+`Retry-After` set to that timeout in whole seconds. If the first one commits during the
+wait, the duplicate gets its stored response (or, under `REPEATABLE READ` or
+`SERIALIZABLE`, a 409 whose retry gets it). The lock timeout covers only the statements
+that claim the record: idemfence restores the previous `lock_timeout` before calling the
+handler, so the handler's own statements run with the connection's normal setting.
+
+`failOpen: true` cannot be combined with `mode: "transactional"`
+(`IdemfenceConfigError` code `FAIL_OPEN_TRANSACTIONAL`): fail-open runs the handler without
+the store, and a transactional handler runs inside the store's transaction.
+
+The transaction holds one pool connection for the handler's whole duration, and idemfence
+never takes a second one while it is open. Size the pool for the number of transactional
+handlers that may run at once, and set
 [`idle_in_transaction_session_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT)
-on the server so a stalled handler cannot hold a connection open indefinitely. The
-transaction's `lock_timeout` (default 250 ms, `lockTimeout` on the store) bounds how long a
-statement waits for a row lock; an invalid value throws `IdemfenceConfigError` with code
-`LOCK_TIMEOUT_INVALID`. Writing the idempotency record inside the handler's transaction, so
-that the record and the handler's writes commit or roll back together (contract rows 11 and
-13), is the next step; until then the record follows lease mode.
+on the server so a stalled handler cannot hold a connection open indefinitely.
+
+When you switch a route from lease to transactional mode with a rolling deploy, instances
+of both modes serve the same keys for a while. A lease-mode instance claims the record with
+an autocommit statement that sets no `lock_timeout` of its own, so when a transactional instance holds the
+same key, the lease-mode request waits for the whole of that handler's run before it gets
+its answer. Keep that window short, or drain one mode before the other takes traffic.
 
 Another SQL driver can be used in place of `pg` by implementing `SqlExecutor` and a store
 that accepts it; only the Postgres store ships today.
