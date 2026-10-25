@@ -1,8 +1,9 @@
+import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import { setTimeout as sleep } from "node:timers/promises";
-import { parseArgs } from "node:util";
+import { parseArgs, promisify } from "node:util";
 
 // ---------------------------------------------------------------------------------------
 // Target configuration
@@ -52,7 +53,29 @@ export interface TargetConfig {
     passthrough?: Fixture;
     /** How to send a request without a principal: headers to leave out. */
     noPrincipal?: { omitHeaders: string[] };
+    /**
+     * Crash group: an idempotent request whose handler writes one side effect (counted by
+     * `count`) at once, then works for well over 500 ms, so the target can be killed
+     * mid-request.
+     */
+    crash?: Fixture;
   };
+  /**
+   * Crash group only: how to kill and restart the target. The CLI runs these commands
+   * itself, with execFile (no shell).
+   */
+  crash?: CrashConfig;
+}
+
+export interface CrashConfig {
+  /** argv of the command that kills the target abruptly (SIGKILL), for example via compose. */
+  kill: string[];
+  /** argv of the command that starts the killed target again. */
+  start: string[];
+  /** A GET path that answers 200 once the restarted target is ready, for example `/healthz`. */
+  readyPath: string;
+  /** Lease mode: the target's lease in milliseconds, which bounds the 409 window. */
+  leaseMs?: number;
 }
 
 export class ConfigError extends Error {
@@ -258,6 +281,56 @@ export function validateConfig(value: unknown): TargetConfig {
         };
       }
     }
+    const crashFixture = fixture("crash");
+    if (crashFixture !== undefined) {
+      fixtures.crash = base(crashFixture);
+    }
+  }
+
+  let crash: CrashConfig | undefined;
+  if (object.crash !== undefined) {
+    const raw = isRecord(object.crash) ? object.crash : undefined;
+    if (raw === undefined) {
+      problems.push("crash must be an object");
+    } else {
+      const argv = (name: "kill" | "start"): string[] | undefined => {
+        const value = raw[name];
+        if (
+          !Array.isArray(value) ||
+          value.length === 0 ||
+          !value.every((part) => typeof part === "string" && part !== "")
+        ) {
+          problems.push(
+            `crash.${name} must be a non-empty array of non-empty strings (argv, run without a shell)`,
+          );
+          return undefined;
+        }
+        return value as string[];
+      };
+      const kill = argv("kill");
+      const start = argv("start");
+      if (typeof raw.readyPath !== "string" || !raw.readyPath.startsWith("/")) {
+        problems.push("crash.readyPath must start with /");
+      }
+      if (
+        raw.leaseMs !== undefined &&
+        (!Number.isInteger(raw.leaseMs) || (raw.leaseMs as number) < 1)
+      ) {
+        problems.push(
+          "crash.leaseMs must be a positive integer (milliseconds) when present",
+        );
+      }
+      if (kill !== undefined && start !== undefined) {
+        crash = {
+          kill,
+          start,
+          readyPath: String(raw.readyPath),
+          ...(raw.leaseMs === undefined
+            ? {}
+            : { leaseMs: raw.leaseMs as number }),
+        };
+      }
+    }
   }
 
   if (problems.length > 0) {
@@ -271,6 +344,7 @@ export function validateConfig(value: unknown): TargetConfig {
     keySyntax: keySyntax as TargetConfig["keySyntax"],
     mode: mode as TargetConfig["mode"],
     fixtures,
+    ...(crash === undefined ? {} : { crash }),
   };
 }
 
@@ -288,14 +362,15 @@ export interface CliOptions {
   json: boolean;
   requireAll: boolean;
   only: number[] | undefined;
-  group: "contract" | "concurrency";
+  group: "contract" | "concurrency" | "crash";
   iterations: number;
   concurrency: number;
 }
 
 export const USAGE = `Usage: idemfence-conformance --url <base-url> --config <target.json> [options]
 
-Runs the Contract group of the idemfence conformance suite against an HTTP target.
+Runs a group of the idemfence conformance suite (Contract by default) against an HTTP
+target.
 
 Options:
   --url <base-url>      Base URL of the target, for example http://127.0.0.1:3000
@@ -303,7 +378,8 @@ Options:
   --json                Machine-readable output
   --require-all         Treat scenarios that were not run (missing fixtures) as failures
   --only <rows>         Comma-separated row numbers to run, for example 5,6,7
-  --group <name>        contract (default) or concurrency
+  --group <name>        contract (default), concurrency or crash (the crash group runs
+                        the config's crash.kill and crash.start commands)
   --iterations <n>      Concurrency group: iterations (default 1000)
   --concurrency <n>     Concurrency group: requests per iteration (default 50)
   --help                Show this help
@@ -363,8 +439,8 @@ export function parseCliArgs(
     }
   }
   const group = values.group;
-  if (group !== "contract" && group !== "concurrency") {
-    problems.push("--group must be contract or concurrency");
+  if (group !== "contract" && group !== "concurrency" && group !== "crash") {
+    problems.push("--group must be contract, concurrency or crash");
   }
   const iterations = Number(values.iterations);
   if (!Number.isInteger(iterations) || iterations < 1) {
@@ -383,7 +459,7 @@ export function parseCliArgs(
     json: values.json,
     requireAll: values["require-all"],
     only,
-    group: group as "contract" | "concurrency",
+    group: group as CliOptions["group"],
     iterations,
     concurrency,
   };
@@ -1494,6 +1570,274 @@ export function formatConcurrency(
   }
   lines.push(
     `summary: ${result.iterations - result.failures.length} iterations passed, ${result.failures.length} failed: ${result.ok ? "OK" : "NOT OK"}`,
+  );
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------------------
+// Crash group
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Lease mode: how much longer than the lease, counted from the moment the restarted target
+ * is ready, the suite may keep getting 409s before a retry is answered otherwise (the time
+ * is taken when that retry is sent, so the handler's own work does not count). It covers
+ * the retry pacing, request latency and the target's database clock against this
+ * machine's.
+ */
+export const CRASH_SLACK_MS = 3_000;
+/** How long after sending the crash request the target is killed. */
+export const CRASH_KILL_AFTER_MS = 500;
+const CRASH_COMMAND_TIMEOUT_MS = 120_000;
+const CRASH_READY_DEADLINE_MS = 120_000;
+const CRASH_RETRY_PAUSE_MS = 100;
+
+export interface CrashResult {
+  group: "crash";
+  mode: TargetConfig["mode"];
+  /** Failed checks; empty when the group passed. */
+  messages: string[];
+  /** What was observed, for the record. */
+  notes: string[];
+  /** 409 answers to the retries after the restart. */
+  conflicts: number;
+  /** From the kill command to the restarted target answering readyPath. */
+  restartMs: number;
+  /**
+   * From the restarted target being ready to sending the first request that was not
+   * answered 409.
+   */
+  firstSuccessMs: number | null;
+  durationMs: number;
+  ok: boolean;
+}
+
+/**
+ * Runs the Crash group: sends the crash fixture, kills the target CRASH_KILL_AFTER_MS later
+ * with `crash.kill`, restarts it with `crash.start`, waits for `crash.readyPath`, and retries
+ * with the same key and body. Lease mode: the retries are 409s with Retry-After until a
+ * non-409 arrives within the lease plus CRASH_SLACK_MS, between the restart and that answer
+ * the count rises by exactly 1, and a further retry replays. Transactional mode: the first
+ * retry succeeds, the count rises by exactly 1 over the whole scenario, and a further retry
+ * replays.
+ */
+export async function runCrashGroup(
+  baseUrl: string,
+  config: TargetConfig,
+): Promise<CrashResult> {
+  if (config.acknowledgeSideEffects !== true) {
+    throw new ConfigError([SIDE_EFFECTS_MESSAGE]);
+  }
+  const fixture = config.fixtures.crash;
+  const count = config.fixtures.count;
+  const crash = config.crash;
+  const problems: string[] = [];
+  if (fixture === undefined || count === undefined) {
+    problems.push("the crash group needs the crash and count fixtures");
+  }
+  if (crash === undefined) {
+    problems.push(
+      "the crash group needs the crash section (kill, start, readyPath)",
+    );
+  } else if (config.mode === "lease" && crash.leaseMs === undefined) {
+    problems.push("the crash group needs crash.leaseMs in lease mode");
+  }
+  if (
+    problems.length > 0 ||
+    fixture === undefined ||
+    count === undefined ||
+    crash === undefined
+  ) {
+    throw new ConfigError(problems);
+  }
+
+  const client = new Client(new URL(baseUrl), config.headers);
+  const check = new Check();
+  const notes: string[] = [];
+  const run = async (name: string, argv: readonly string[]) => {
+    const [command, ...args] = argv as [string, ...string[]];
+    try {
+      await promisify(execFile)(command, args, {
+        timeout: CRASH_COMMAND_TIMEOUT_MS,
+      });
+    } catch (error) {
+      throw new Error(
+        `crash.${name} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+  const readCount = async (): Promise<number> => {
+    const reply = await client.send({ method: "GET", path: count.path });
+    const body = JSON.parse(reply.bytes.toString("utf8")) as {
+      count?: unknown;
+    };
+    if (reply.status !== 200 || typeof body.count !== "number") {
+      throw new Error(`count fixture ${count.path} returned ${reply.status}`);
+    }
+    return body.count;
+  };
+  const ready = async (): Promise<void> => {
+    const deadline = Date.now() + CRASH_READY_DEADLINE_MS;
+    for (;;) {
+      try {
+        const reply = await client.send({
+          method: "GET",
+          path: crash.readyPath,
+        });
+        if (reply.status === 200) {
+          return;
+        }
+      } catch {
+        // Not listening yet.
+      }
+      if (Date.now() > deadline) {
+        throw new Error(
+          `${crash.readyPath} did not answer 200 within ${CRASH_READY_DEADLINE_MS} ms of crash.start`,
+        );
+      }
+      await sleep(250);
+    }
+  };
+
+  const startedAt = Date.now();
+  const key = newKey();
+  const before = await readCount();
+  const killed = client.send(fixture, { key }).then(
+    (reply) => reply,
+    (error: unknown) => error,
+  );
+  await sleep(CRASH_KILL_AFTER_MS);
+  const killedAt = Date.now();
+  await run("kill", crash.kill);
+  const killedOutcome = await killed;
+  if (
+    typeof killedOutcome === "object" &&
+    killedOutcome !== null &&
+    "status" in killedOutcome
+  ) {
+    check.that(
+      false,
+      `the crash request was answered (${String(killedOutcome.status)}) before the kill; its handler must work for well over ${CRASH_KILL_AFTER_MS} ms`,
+    );
+  }
+  await run("start", crash.start);
+  await ready();
+  const readyAt = Date.now();
+  const restartMs = readyAt - killedAt;
+  const atRestart = await readCount();
+
+  let conflicts = 0;
+  let first: Reply | undefined;
+  let firstSuccessMs: number | null = null;
+  if (config.mode === "lease") {
+    const leaseMs = crash.leaseMs ?? 0;
+    notes.push(
+      `the killed attempt's write survived the crash: the count rose by ${atRestart - before} before the restart`,
+    );
+    for (;;) {
+      // Measured when the request leaves, so the handler's own work is not counted.
+      const sentAfterReady = Date.now() - readyAt;
+      const reply = await client.send(fixture, { key });
+      if (reply.status !== 409) {
+        first = reply;
+        firstSuccessMs = sentAfterReady;
+        break;
+      }
+      conflicts += 1;
+      const sub = new Check();
+      problem(sub, reply, 409, "in-flight");
+      sub.that(
+        /^[1-9]\d*$/.test(String(reply.headers["retry-after"] ?? "")),
+        "a 409 must carry an integer Retry-After",
+      );
+      for (const message of sub.messages) {
+        check.that(false, `retry ${conflicts}: ${message}`);
+      }
+      if (Date.now() - readyAt > leaseMs + CRASH_SLACK_MS) {
+        check.that(
+          false,
+          `still 409 more than lease (${leaseMs} ms) + ${CRASH_SLACK_MS} ms after the restart`,
+        );
+        break;
+      }
+      await sleep(CRASH_RETRY_PAUSE_MS);
+    }
+    if (first !== undefined) {
+      check.that(
+        first.status >= 200 && first.status < 300,
+        `the first answer after the 409s should be a 2xx, got ${first.status}`,
+      );
+      check.that(
+        !replayed(first),
+        "the first answer after the 409s must be a fresh execution, not a replay",
+      );
+      check.that(
+        (firstSuccessMs ?? 0) <= leaseMs + CRASH_SLACK_MS,
+        `the first request answered with a non-409 was sent ${firstSuccessMs} ms after the restart, over lease (${leaseMs} ms) + ${CRASH_SLACK_MS} ms`,
+      );
+      const after = await readCount();
+      check.that(
+        after - atRestart === 1,
+        `between the restart and the first success the count should rise by exactly 1, it rose by ${after - atRestart}`,
+      );
+    }
+  } else {
+    firstSuccessMs = Date.now() - readyAt;
+    first = await client.send(fixture, { key });
+    check.that(
+      first.status >= 200 && first.status < 300,
+      `the first retry after the restart should succeed (the killed transaction rolled back), got ${first.status}`,
+    );
+    check.that(
+      !replayed(first),
+      "the first retry after the restart must be a fresh execution, not a replay",
+    );
+    const after = await readCount();
+    check.that(
+      after - before === 1,
+      `over the whole scenario the count should rise by exactly 1 (the killed attempt's write rolled back), it rose by ${after - before}`,
+    );
+  }
+
+  if (first !== undefined && first.status >= 200 && first.status < 300) {
+    const replay = await client.send(fixture, { key });
+    check.that(
+      replayed(replay),
+      "a further retry must be a replay (Idempotent-Replayed: true)",
+    );
+    check.that(
+      replay.bytes.equals(first.bytes),
+      "the replay must be byte-identical to the first success",
+    );
+  }
+
+  return {
+    group: "crash",
+    mode: config.mode,
+    messages: check.messages,
+    notes,
+    conflicts,
+    restartMs,
+    firstSuccessMs,
+    durationMs: Date.now() - startedAt,
+    ok: check.outcome === "pass",
+  };
+}
+
+export function formatCrash(baseUrl: string, result: CrashResult): string {
+  const lines = [
+    `idemfence conformance, Crash group, target ${baseUrl}, ${result.mode} mode`,
+    `  killed ${CRASH_KILL_AFTER_MS} ms into the request; ready again ${result.restartMs} ms after the kill`,
+    `  retries after the restart: ${result.conflicts} x 409, then the first request answered otherwise was sent ${result.firstSuccessMs === null ? "never" : `${result.firstSuccessMs} ms after the restart`}`,
+  ];
+  for (const note of result.notes) {
+    lines.push(`  note: ${note}`);
+  }
+  for (const message of result.messages) {
+    lines.push(`  FAIL: ${message}`);
+  }
+  lines.push(
+    `summary: crash group ${result.ok ? "passed" : "failed"} in ${(result.durationMs / 1000).toFixed(1)} s: ${result.ok ? "OK" : "NOT OK"}`,
   );
   return lines.join("\n");
 }

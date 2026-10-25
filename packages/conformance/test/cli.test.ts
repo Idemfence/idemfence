@@ -16,6 +16,7 @@ import {
   parseCliArgs,
   type RowResult,
   runContractGroup,
+  runCrashGroup,
   SIDE_EFFECTS_MESSAGE,
   summarize,
   validateConfig,
@@ -81,6 +82,19 @@ describe("parseCliArgs", () => {
     });
   });
 
+  it("parses the crash group", () => {
+    expect(
+      parseCliArgs([
+        "--url",
+        "http://x",
+        "--config",
+        "t.json",
+        "--group",
+        "crash",
+      ]),
+    ).toMatchObject({ group: "crash" });
+  });
+
   it("returns help", () => {
     expect(parseCliArgs(["--help"])).toStrictEqual({ help: true });
   });
@@ -134,6 +148,48 @@ describe("validateConfig", () => {
       mode: "lease",
       fixtures: {},
     });
+  });
+
+  it("accepts the crash fixture and the crash commands", () => {
+    const config = validateConfig({
+      ...minimal,
+      fixtures: { crash: { method: "POST", path: "/crash", body: { a: 1 } } },
+      crash: {
+        kill: ["docker", "compose", "kill", "-s", "SIGKILL", "app"],
+        start: ["docker", "compose", "start", "app"],
+        readyPath: "/healthz",
+        leaseMs: 2000,
+      },
+    });
+    expect(config.fixtures.crash).toStrictEqual({
+      method: "POST",
+      path: "/crash",
+      body: { a: 1 },
+    });
+    expect(config.crash).toStrictEqual({
+      kill: ["docker", "compose", "kill", "-s", "SIGKILL", "app"],
+      start: ["docker", "compose", "start", "app"],
+      readyPath: "/healthz",
+      leaseMs: 2000,
+    });
+    expect("crash" in validateConfig(minimal)).toBe(false);
+  });
+
+  it.each([
+    [
+      { kill: "docker kill", start: ["a"], readyPath: "/r" },
+      "crash.kill must be",
+    ],
+    [{ kill: ["a"], start: [], readyPath: "/r" }, "crash.start must be"],
+    [{ kill: ["a", ""], start: ["b"], readyPath: "/r" }, "crash.kill must be"],
+    [{ kill: ["a"], start: ["b"], readyPath: "r" }, "crash.readyPath must"],
+    [
+      { kill: ["a"], start: ["b"], readyPath: "/r", leaseMs: 0 },
+      "crash.leaseMs must",
+    ],
+    ["kill it", "crash must be an object"],
+  ])("rejects crash %j", (crash, message) => {
+    expect(() => validateConfig({ ...minimal, crash })).toThrow(message);
   });
 
   it("accepts mode transactional", () => {
@@ -379,6 +435,45 @@ describe("summarize and formatHuman", () => {
     expect(text).toMatch(
       /summary: 2 passed, 0 failed, 0 not run, 0 not testable, 1 not applicable, 0 skipped: OK$/,
     );
+  });
+});
+
+describe("runCrashGroup configuration", () => {
+  const crashFixtures = {
+    crash: { method: "POST", path: "/crash" },
+    count: { path: "/count" },
+  };
+  const commands = { kill: ["true"], start: ["true"], readyPath: "/healthz" };
+
+  it("needs the crash and count fixtures and the crash section", async () => {
+    await expect(
+      runCrashGroup("http://127.0.0.1:1", validateConfig(minimal)),
+    ).rejects.toThrow(/crash and count fixtures[\s\S]*crash section/);
+  });
+
+  it("needs crash.leaseMs in lease mode, not in transactional mode", async () => {
+    await expect(
+      runCrashGroup(
+        "http://127.0.0.1:1",
+        validateConfig({
+          ...minimal,
+          fixtures: crashFixtures,
+          crash: commands,
+        }),
+      ),
+    ).rejects.toThrow("crash.leaseMs in lease mode");
+    // Transactional mode passes validation and goes on to the target, here unreachable.
+    await expect(
+      runCrashGroup(
+        "http://127.0.0.1:1",
+        validateConfig({
+          ...minimal,
+          mode: "transactional",
+          fixtures: crashFixtures,
+          crash: commands,
+        }),
+      ),
+    ).rejects.not.toBeInstanceOf(ConfigError);
   });
 });
 

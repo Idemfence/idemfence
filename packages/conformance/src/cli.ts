@@ -3,10 +3,12 @@ import { readFile } from "node:fs/promises";
 import {
   ConfigError,
   formatConcurrency,
+  formatCrash,
   formatHuman,
   parseCliArgs,
   runConcurrencyGroup,
   runContractGroup,
+  runCrashGroup,
   summarize,
   USAGE,
   validateConfig,
@@ -42,9 +44,31 @@ async function main(): Promise<number> {
 
   // Lease is the default; only a transactional target is named, so lease output is unchanged.
   const transactional = config.mode === "transactional";
+  const groupName = {
+    contract: "Contract",
+    concurrency: "Concurrency",
+    crash: "Crash",
+  }[options.group];
   console.error(
-    `idemfence-conformance: running the ${options.group === "concurrency" ? "Concurrency" : "Contract"} group against ${options.url}${transactional ? " in transactional mode" : ""}; every scenario creates real side effects in the target.`,
+    `idemfence-conformance: running the ${groupName} group against ${options.url}${transactional ? " in transactional mode" : ""}; every scenario creates real side effects in the target.`,
   );
+  if (options.group === "crash") {
+    let result: Awaited<ReturnType<typeof runCrashGroup>>;
+    try {
+      result = await runCrashGroup(options.url, config);
+    } catch (error) {
+      console.error(
+        `idemfence-conformance: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return 2;
+    }
+    console.log(
+      options.json
+        ? JSON.stringify({ url: options.url, ...result }, null, 2)
+        : formatCrash(options.url, result),
+    );
+    return result.ok ? 0 : 1;
+  }
   if (options.group === "concurrency") {
     let result: Awaited<ReturnType<typeof runConcurrencyGroup>>;
     try {
