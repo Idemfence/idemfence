@@ -76,8 +76,15 @@ exists anywhere. The steps are:
    A version that is staged but not yet approved still reads as "not on npm" (404), so a
    rerun of the workflow for the same version fails at `npm stage publish`; that is expected.
    Approve or reject the pending stage first.
-4. **The maintainer approves the staged package on npm** (`npm stage approve` or the Staged
-   Packages tab on npmjs.com), with 2FA. Only then is the version publicly installable.
+4. **The maintainer verifies and approves the staged package on npm.** Before approving:
+   run `npm stage download <stage-id>` and compute the tarball's sha256; pack the same commit
+   locally from a fresh clone (`pnpm install --frozen-lockfile && pnpm build`, then `pnpm pack`
+   in `packages/idemfence`) and compute that sha256; approve (`npm stage approve <stage-id>`
+   or the Staged Packages tab on npmjs.com, with 2FA) only if both equal the sha256 logged by
+   `release.yml`'s `build` job; otherwise `npm stage reject` it. `pnpm pack` is reproducible:
+   for 0.0.0 the registry tarball, the CI build and an independent local build on another
+   machine and Node version all had the same sha256. Only after approval is the version
+   publicly installable.
 5. **The maintainer publishes the draft release**, which creates the immutable tag
    `idemfence@<version>` (a tag ruleset blocks updating or deleting these tags).
 

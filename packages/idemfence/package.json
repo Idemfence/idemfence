@@ -1,6 +1,6 @@
 {
   "name": "idemfence",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "HTTP idempotency-key middleware with fencing-token crash safety",
   "keywords": [
     "idempotency",
@@ -11,8 +11,7 @@
     "fencing-token",
     "fetch",
     "hono",
-    "retry",
-    "exactly-once"
+    "retry"
   ],
   "license": "Apache-2.0",
   "homepage": "https://github.com/Idemfence/idemfence#readme",
