@@ -27,6 +27,11 @@ export interface TargetConfig {
   keyMaxLength: number;
   requestBodyCap: number;
   keySyntax: "sf-string" | "sf-string-or-raw";
+  /**
+   * The idemfence mode of the target's routes (docs/contract.md section 7); default
+   * `"lease"`. In `"transactional"` mode row 13 is tested and rows 9 and 12 do not apply.
+   */
+  mode: "lease" | "transactional";
   fixtures: {
     /** A normal idempotent POST; `alternateBody` is a different payload for row 7. */
     create?: Fixture & { alternateBody: unknown };
@@ -36,7 +41,10 @@ export interface TargetConfig {
     slow?: Fixture & { workMs: number; workField: string };
     /** An idempotent request answered with the configured release status. */
     release?: Fixture & { status: number };
-    /** An idempotent request whose handler throws. */
+    /**
+     * An idempotent request whose handler throws. In transactional mode it should write a
+     * side effect first, so the count proves the rollback.
+     */
     throws?: Fixture;
     /** An idempotent request on a route whose retention is `retentionMs`. */
     shortRetention?: Fixture & { retentionMs: number };
@@ -111,6 +119,10 @@ export function validateConfig(value: unknown): TargetConfig {
   const keySyntax = object.keySyntax ?? "sf-string";
   if (keySyntax !== "sf-string" && keySyntax !== "sf-string-or-raw") {
     problems.push('keySyntax must be "sf-string" or "sf-string-or-raw"');
+  }
+  const mode = object.mode ?? "lease";
+  if (mode !== "lease" && mode !== "transactional") {
+    problems.push('mode must be "lease" or "transactional"');
   }
 
   const fixtures: TargetConfig["fixtures"] = {};
@@ -257,6 +269,7 @@ export function validateConfig(value: unknown): TargetConfig {
     keyMaxLength: keyMaxLength as number,
     requestBodyCap: requestBodyCap as number,
     keySyntax: keySyntax as TargetConfig["keySyntax"],
+    mode: mode as TargetConfig["mode"],
     fixtures,
   };
 }
@@ -555,7 +568,13 @@ class Client {
 // Scenarios
 // ---------------------------------------------------------------------------------------
 
-export type Outcome = "pass" | "fail" | "not_run" | "not_testable" | "skipped";
+export type Outcome =
+  | "pass"
+  | "fail"
+  | "not_run"
+  | "not_testable"
+  | "not_applicable"
+  | "skipped";
 
 export interface RowResult {
   row: string;
@@ -661,11 +680,17 @@ const replayed = (reply: Reply): boolean =>
   String(reply.headers["idempotent-replayed"] ?? "") === "true";
 
 type Scenario = (ctx: Context, check: Check) => Promise<void>;
+type Plan = Scenario | { notTestable: string } | { notApplicable: string };
+
+export const NOT_APPLICABLE_IN_TRANSACTIONAL_MODE =
+  "not applicable in transactional mode";
 
 const scenarios: {
   row: string;
   title: string;
-  scenario: Scenario | { notTestable: string };
+  scenario: Plan;
+  /** Replaces `scenario` when the target's mode is transactional. */
+  transactional?: Plan;
 }[] = [
   {
     row: "1",
@@ -866,6 +891,10 @@ const scenarios: {
     scenario: {
       notTestable: "not testable black-box here (covered by step 2.5)",
     },
+    // Contract section 7: a crashed handler's transaction rolls back and frees the key.
+    transactional: {
+      notApplicable: `${NOT_APPLICABLE_IN_TRANSACTIONAL_MODE}: a crashed handler's transaction rolls back and frees the key`,
+    },
   },
   {
     row: "10",
@@ -902,6 +931,9 @@ const scenarios: {
     scenario: async (ctx, check) => {
       const fixture = ctx.fixture("release");
       const key = newKey();
+      // In transactional mode the release rolls the handler's writes back as well.
+      const before =
+        ctx.config.mode === "transactional" ? await ctx.count() : undefined;
       const first = await ctx.client.send(fixture, { key });
       check.that(
         first.status === fixture.status,
@@ -920,6 +952,13 @@ const scenarios: {
         !replayed(second),
         "the retry must be a fresh execution, not a replay",
       );
+      if (before !== undefined) {
+        const after = await ctx.count();
+        check.that(
+          after === before,
+          `a released response must roll back its side effects in transactional mode, count went from ${before} to ${after}`,
+        );
+      }
     },
   },
   {
@@ -949,12 +988,42 @@ const scenarios: {
         "the handler must not run again after a stored failure",
       );
     },
+    transactional: {
+      notApplicable: `${NOT_APPLICABLE_IN_TRANSACTIONAL_MODE}: a throw is rolled back, not stored (row 13)`,
+    },
   },
   {
     row: "13",
     title: "a throw in transactional mode rolls back",
     scenario: {
       notTestable: "not testable black-box here (covered by step 2.2)",
+    },
+    transactional: async (ctx, check) => {
+      const fixture = ctx.fixture("throws");
+      const key = newKey();
+      const before = await ctx.count();
+      const first = await ctx.client.send(fixture, { key });
+      problem(check, first, 500, "about:blank");
+      check.that(
+        !replayed(first),
+        "the 500 must not carry Idempotent-Replayed",
+      );
+      // Nothing was stored, so the retry runs the handler again: a fresh 500.
+      const second = await ctx.client.send(fixture, { key });
+      const sub = new Check();
+      problem(sub, second, 500, "about:blank");
+      for (const message of sub.messages) {
+        check.that(false, `retry: ${message}`);
+      }
+      check.that(
+        !replayed(second),
+        "the retry must be a fresh execution, not a replay of a stored 500",
+      );
+      const after = await ctx.count();
+      check.that(
+        after === before,
+        `a throw must roll back its side effects, count went from ${before} to ${after}`,
+      );
     },
   },
   {
@@ -1064,7 +1133,12 @@ export async function runContractGroup(
   };
 
   const results: RowResult[] = [];
-  for (const { row, title, scenario } of scenarios) {
+  for (const entry of scenarios) {
+    const { row, title } = entry;
+    const scenario =
+      config.mode === "transactional" && entry.transactional !== undefined
+        ? entry.transactional
+        : entry.scenario;
     const startedAt = Date.now();
     if (only !== undefined && !only.has(row)) {
       results.push({
@@ -1080,8 +1154,9 @@ export async function runContractGroup(
       results.push({
         row,
         title,
-        outcome: "not_testable",
-        messages: [scenario.notTestable],
+        ...("notTestable" in scenario
+          ? { outcome: "not_testable", messages: [scenario.notTestable] }
+          : { outcome: "not_applicable", messages: [scenario.notApplicable] }),
         durationMs: 0,
       });
       continue;
@@ -1118,21 +1193,30 @@ export interface Summary {
   fail: number;
   notRun: number;
   notTestable: number;
+  /** Rows that do not apply to the target's mode; present only when there are any. */
+  notApplicable?: number;
   skipped: number;
   ok: boolean;
 }
 
+/**
+ * Counts the outcomes. Not-testable and not-applicable rows never fail and are not counted
+ * by `requireAll`.
+ */
 export function summarize(
   results: readonly RowResult[],
   requireAll: boolean,
 ): Summary {
   const count = (outcome: Outcome) =>
     results.filter((r) => r.outcome === outcome).length;
+  const notApplicable = count("not_applicable");
   const summary = {
     pass: count("pass"),
     fail: count("fail"),
     notRun: count("not_run"),
     notTestable: count("not_testable"),
+    // Omitted when zero, so lease-mode output is unchanged.
+    ...(notApplicable === 0 ? {} : { notApplicable }),
     skipped: count("skipped"),
   };
   return {
@@ -1145,25 +1229,34 @@ export function formatHuman(
   baseUrl: string,
   results: readonly RowResult[],
   summary: Summary,
+  mode: TargetConfig["mode"] = "lease",
 ): string {
   const label: Record<Outcome, string> = {
     pass: "pass",
     fail: "FAIL",
     not_run: "not run",
     not_testable: "not testable",
+    not_applicable: "not applicable",
     skipped: "skipped",
   };
-  const lines = [`idemfence conformance, Contract group, target ${baseUrl}`];
+  const width = Math.max(13, ...results.map((r) => label[r.outcome].length));
+  const lines = [
+    `idemfence conformance, Contract group, target ${baseUrl}${mode === "transactional" ? ", transactional mode" : ""}`,
+  ];
   for (const result of results) {
     lines.push(
-      `  row ${result.row.padEnd(3)} ${label[result.outcome].padEnd(13)} ${result.title}`,
+      `  row ${result.row.padEnd(3)} ${label[result.outcome].padEnd(width)} ${result.title}`,
     );
     for (const message of result.messages) {
       lines.push(`      ${message}`);
     }
   }
+  const notApplicable =
+    summary.notApplicable === undefined
+      ? ""
+      : `, ${summary.notApplicable} not applicable`;
   lines.push(
-    `summary: ${summary.pass} passed, ${summary.fail} failed, ${summary.notRun} not run, ${summary.notTestable} not testable, ${summary.skipped} skipped: ${summary.ok ? "OK" : "NOT OK"}`,
+    `summary: ${summary.pass} passed, ${summary.fail} failed, ${summary.notRun} not run, ${summary.notTestable} not testable${notApplicable}, ${summary.skipped} skipped: ${summary.ok ? "OK" : "NOT OK"}`,
   );
   return lines.join("\n");
 }

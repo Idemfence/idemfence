@@ -120,8 +120,17 @@ jobs:
         run: pnpm audit --audit-level moderate
 
   reference-app:
-    name: reference-app
+    name: reference-app (${{ matrix.mode }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every idempotent route of the reference app runs in this idemfence mode.
+        mode: [lease, transactional]
+    env:
+      # Read by compose.yaml.
+      IDEMFENCE_MODE: ${{ matrix.mode }}
+      CONFORMANCE_CONFIG: ${{ matrix.mode == 'transactional' && 'reference-app/conformance.transactional.json' || 'reference-app/conformance.json' }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -154,9 +163,11 @@ jobs:
         run: bash reference-app/smoke.sh
 
       - name: Conformance (must pass)
-        run: node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config reference-app/conformance.json --require-all
+        run: node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config "$CONFORMANCE_CONFIG" --require-all
 
+      # The non-conforming routes have no idemfence, so one mode is enough.
       - name: Conformance against the non-conforming routes (must fail)
+        if: ${{ matrix.mode == 'lease' }}
         run: |
           set +e
           node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config reference-app/conformance.nonconforming.json --json > nonconforming.json
@@ -169,7 +180,7 @@ jobs:
           echo "non-conforming run exited $status and row 6 reported a duplicate side effect"
 
       - name: Conformance, Concurrency group (1000 x 50)
-        run: node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config reference-app/conformance.json --group concurrency
+        run: node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config "$CONFORMANCE_CONFIG" --group concurrency
 
       - name: Show logs on failure
         if: ${{ failure() }}
