@@ -177,6 +177,14 @@ const charge = idempotent(idem, { routeTemplate: "/orders/:id/pay" }, async (req
   not enforce) has nothing to derive from: `ctx.deriveKey` is still there, but rejects with
   code `DERIVE_KEY_UNAVAILABLE`.
 - Derived keys never appear in idemfence's logs or in the problem responses it generates.
+- The key depends on the client's `Idempotency-Key` (through the lookup key), not on the
+  request body. A reused key with a different payload is normally rejected with a 422 before
+  your handler runs, but two cases still reach it: a key reused after `retention`, and a
+  fail-open run, where the store (and with it the payload check) is bypassed. The
+  downstream service then sees the same key with different parameters. Some providers
+  reject that; others return the earlier result. If that matters, keep the downstream
+  service's retention no longer than yours, or check the downstream response against the
+  current request.
 
 **Secrets and rotation.** `secret` is the current secret and `previousSecrets` the earlier
 ones, newest first and oldest last. Derived keys use the oldest configured secret: the last

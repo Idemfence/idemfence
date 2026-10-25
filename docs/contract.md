@@ -229,6 +229,11 @@ derived key = lowercase hex( HMAC-SHA256( K, enc("idemfence/derive/v1") || enc(l
 - Every attempt of the same request derives the same key: a retry after a throw or a release
   status, a lease takeover (row 9), and a fail-open run (row 14), where the lookup key is
   known even though the store is bypassed.
+- The derived key depends on the lookup key, not on the request fingerprint. A different
+  request with the same lookup key normally never reaches the handler (row 7), but two
+  cases do derive the same key for a different payload: a key reused after retention
+  (row 10), and a fail-open run (row 14), where no fingerprint check takes place. The
+  downstream service then sees a reused key with different parameters.
 - Derived keys MUST NOT appear in log entries (section 8) or in any response or problem body
   that idemfence itself generates.
 - The tag, the encoding and the choice of `K` are observable behaviour (section 9). Test
