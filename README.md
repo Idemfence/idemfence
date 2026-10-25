@@ -49,6 +49,15 @@ back when it throws. In lease mode `ctx.tx` is absent.
 import { createIdemfence } from "idemfence";
 import { idempotent } from "idemfence/fetch";
 import { postgresStore } from "idemfence/postgres";
+import pg from "pg";
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+// Required: node-postgres emits errors from idle clients (for example a backend that
+// died while the client sat in the pool) on the pool. Without a handler they crash the
+// process.
+pool.on("error", (error) => {
+  console.error("pg pool error", error);
+});
 
 const store = postgresStore({ pool, lockTimeout: "250ms" });
 const idem = createIdemfence({ store, scope, secret, docsUrl });
@@ -62,6 +71,12 @@ const createOrder = idempotent(
   },
 );
 ```
+
+Your `pg.Pool` must have a `pool.on("error", ...)` handler, as in the example above:
+node-postgres emits idle-client errors on the pool, and an `'error'` event with no listener
+crashes the process. idemfence handles errors on the client it has checked out for a
+transaction and destroys that client instead of returning it to the pool; the pool handler
+covers clients that fail while idle.
 
 The transaction holds one pool connection for the handler's whole duration, so size the
 pool for the number of transactional handlers that may run at once, and set

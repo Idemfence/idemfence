@@ -6,11 +6,20 @@
  * - `SCHEMA_NAME_INVALID`: the `schema` option is not a valid, unquoted Postgres identifier.
  * - `BEGIN_RACE_EXHAUSTED`: the record kept disappearing between the statements of `begin`
  *   after the maximum number of attempts.
+ * - `TRANSACTION_UNAVAILABLE`: a transaction could not be opened (no connection, or `BEGIN`
+ *   or `SET LOCAL` failed); nothing ran. The `cause` is the driver's error.
+ * - `COMMIT_REJECTED`: the server answered `COMMIT` with an error, so the transaction was
+ *   rolled back for certain. The `cause` is the server's error (SQLSTATE in `cause.code`).
+ * - `COMMIT_UNKNOWN`: the connection failed during `COMMIT` with no answer from the server,
+ *   so the transaction may or may not have committed. The `cause` is the driver's error.
  */
 export type IdemfenceStoreErrorCode =
   | "SCHEMA_VERSION_MISMATCH"
   | "SCHEMA_NAME_INVALID"
-  | "BEGIN_RACE_EXHAUSTED";
+  | "BEGIN_RACE_EXHAUSTED"
+  | "TRANSACTION_UNAVAILABLE"
+  | "COMMIT_REJECTED"
+  | "COMMIT_UNKNOWN";
 
 /** Thrown by a store for conditions that are not a normal `begin` outcome. */
 export class IdemfenceStoreError extends Error {
@@ -108,7 +117,9 @@ export interface Store {
 /**
  * A store that can also run the handler inside one of its transactions (transactional mode,
  * docs/contract.md section 7). `transaction` commits when `fn` resolves, rolls back when it
- * rejects, and holds one connection for the whole call.
+ * rejects (rethrowing `fn`'s rejection unchanged), and holds one connection for the whole
+ * call. Its own failures are `IdemfenceStoreError`s: `TRANSACTION_UNAVAILABLE`,
+ * `COMMIT_REJECTED` or `COMMIT_UNKNOWN`.
  */
 export interface TransactionalStore extends Store {
   /** The `lock_timeout` applied to each transaction, in milliseconds. */

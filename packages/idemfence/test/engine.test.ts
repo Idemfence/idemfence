@@ -16,7 +16,12 @@ import {
   IdemfenceFencedError,
 } from "../src/engine.js";
 import { lookupKey } from "../src/hash.js";
-import { postgresStore } from "../src/stores/postgres/index.js";
+import {
+  postgresStore,
+  type SqlExecutor,
+  type TransactionalStore,
+  withTransaction,
+} from "../src/stores/postgres/index.js";
 import { connectionFields, databaseUrl, migrate } from "./support/postgres.js";
 
 const url = databaseUrl();
@@ -734,6 +739,170 @@ describe("row 14: store unavailable", () => {
     );
     expect(response.status).toBe(503);
     expect(response.headers.get("retry-after")).toBe("2");
+  });
+
+  it("transactional mode: a store that cannot be reached at begin is a 503, handler not run", async () => {
+    const { handler, calls } = counting();
+    const response = await unreachable.handle(
+      req(freshKey(), { body: "{}" }),
+      { routeTemplate: "/orders", mode: "transactional" },
+      handler,
+    );
+    await expectProblem(response, 503, "store-unavailable");
+    expect(response.headers.get("retry-after")).toBe("5");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("transactional mode: a transaction that cannot be opened is a 503, not a stored 500, and frees the key", async () => {
+    // The record operations reach Postgres; opening the handler's transaction does not.
+    const live = postgresStore({ pool, schema });
+    const txStore: TransactionalStore = {
+      ...live,
+      ready: () => live.ready(),
+      begin: (...args) => live.begin(...args),
+      renew: (...args) => live.renew(...args),
+      complete: (...args) => live.complete(...args),
+      release: (...args) => live.release(...args),
+      purgeExpired: (...args) => live.purgeExpired(...args),
+      lockTimeoutMs: live.lockTimeoutMs,
+      transaction: <T>(fn: (tx: SqlExecutor) => Promise<T>) =>
+        withTransaction(deadPool, {}, fn),
+    };
+    const txUnavailable = createEngine(
+      resolveConfig<Request>({
+        store: txStore,
+        scope: (request) => request.headers.get("x-principal") ?? undefined,
+        secret: SECRET,
+        docsUrl: DOCS,
+        logger,
+      }),
+    );
+    const key = freshKey();
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      mode: "transactional",
+      storeUnavailableRetryAfter: "3s",
+    };
+    const { handler, calls } = counting();
+    const mark = logs.length;
+
+    const response = await txUnavailable.handle(
+      req(key, { body: "{}" }),
+      route,
+      handler,
+    );
+    await expectProblem(response, 503, "store-unavailable");
+    expect(response.headers.get("retry-after")).toBe("3");
+    expect(calls).toHaveLength(0);
+    expect(await record(key)).toBeUndefined();
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          row: 14,
+          outcome: "store-unavailable",
+          error: expect.objectContaining({ name: expect.any(String) }),
+        }),
+      }),
+    ]);
+
+    // The key is free: a retry on a healthy engine runs the handler and completes.
+    const retry = await engine.handle(req(key, { body: "{}" }), route, handler);
+    expect(retry.status).toBe(201);
+    expect(calls).toHaveLength(1);
+    expect(await record(key)).toMatchObject({ state: "completed" });
+  });
+
+  it("transactional mode: a COMMIT failure is a 503 with the handler's writes rolled back and the key free", async () => {
+    await pool.query(
+      `CREATE TABLE "${schema}".deferred (id int UNIQUE DEFERRABLE INITIALLY DEFERRED)`,
+    );
+    const key = freshKey();
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      mode: "transactional",
+    };
+    let runs = 0;
+    const handler = async (
+      _request: Request,
+      ctx: {
+        tx?: { query(t: string, p?: readonly unknown[]): Promise<unknown> };
+      },
+    ) => {
+      runs += 1;
+      // Violates the deferred constraint, so BEGIN and the handler succeed and COMMIT fails.
+      await ctx.tx?.query(
+        `INSERT INTO "${schema}".deferred (id) VALUES (1), (1)`,
+      );
+      return created();
+    };
+    const mark = logs.length;
+    const response = await engine.handle(
+      req(key, { body: "{}" }),
+      route,
+      handler,
+    );
+    await expectProblem(response, 503, "store-unavailable");
+    expect(runs).toBe(1);
+    expect(
+      (await pool.query(`SELECT count(*)::int AS n FROM "${schema}".deferred`))
+        .rows[0].n,
+    ).toBe(0);
+    expect(await record(key)).toBeUndefined();
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          row: 14,
+          outcome: "store-unavailable",
+        }),
+      }),
+    ]);
+  });
+
+  it("transactional mode: a connection failure during COMMIT is a 503 that keeps the lease (outcome unknown)", async () => {
+    const key = freshKey();
+    const route: RouteConfig = {
+      routeTemplate: "/orders",
+      mode: "transactional",
+      storeUnavailableRetryAfter: "4s",
+    };
+    const observer = new pg.Client({ connectionString: url });
+    await observer.connect();
+    const mark = logs.length;
+    try {
+      const response = await engine.handle(
+        req(key, { body: "{}" }),
+        route,
+        async (_request, ctx) => {
+          const pid = (
+            await ctx.tx?.query<{ pid: number }>(
+              "SELECT pg_backend_pid() AS pid",
+            )
+          )?.rows[0]?.pid;
+          await observer.query("SELECT pg_terminate_backend($1)", [pid]);
+          await sleep(50);
+          return created();
+        },
+      );
+      await expectProblem(response, 503, "store-unavailable");
+      expect(response.headers.get("retry-after")).toBe("4");
+    } finally {
+      await observer.end();
+    }
+    // The commit may have landed, so the lease is kept: the key is not free until 2.2 moves
+    // the record into the transaction or the lease expires.
+    expect(await record(key)).toMatchObject({ state: "in_flight" });
+    expect(logsSince(mark)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          row: 14,
+          outcome: "commit-unknown",
+          error: expect.objectContaining({ code: "COMMIT_UNKNOWN" }),
+        }),
+      }),
+    ]);
   });
 
   it("with failOpen, runs the handler without idempotency and logs a warning", async () => {

@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from "pg";
 import { type Duration, lockTimeoutMs } from "../../config.js";
-import type { SqlExecutor } from "../../store.js";
+import { IdemfenceStoreError, type SqlExecutor } from "../../store.js";
 
 export interface TransactionOptions {
   /**
@@ -19,6 +19,12 @@ export interface TransactionOptions {
  * pool, and destroyed instead when the connection errored or `ROLLBACK` itself failed, so a
  * connection whose state is unknown never serves another caller.
  *
+ * Failures of the transaction itself reject with `IdemfenceStoreError` (the driver's error
+ * as `cause`): `TRANSACTION_UNAVAILABLE` when no client could be taken or `BEGIN` or
+ * `SET LOCAL` failed (nothing ran); `COMMIT_REJECTED` when the server answered `COMMIT`
+ * with an error (rolled back for certain); `COMMIT_UNKNOWN` when the connection failed
+ * during `COMMIT` with no answer from the server (the transaction may have committed).
+ *
  * The transaction holds the connection for the whole call: size the pool for the number of
  * handlers that may run at once, and set `idle_in_transaction_session_timeout` on the server
  * so a stalled handler cannot pin a connection forever.
@@ -30,7 +36,12 @@ export async function withTransaction<T>(
 ): Promise<T> {
   // Validated before a client is taken, so a bad option never costs a connection.
   const lockTimeout = lockTimeoutMs(options.lockTimeout);
-  const client = await pool.connect();
+  let client: PoolClient;
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    throw unavailable(error);
+  }
   // A checked-out pg client has no error listener; without one, a backend that dies
   // mid-transaction would raise an unhandled 'error' event instead of failing the query.
   let broken = false;
@@ -39,24 +50,77 @@ export async function withTransaction<T>(
   };
   client.on("error", onError);
   try {
-    await client.query("BEGIN");
-    // lock_timeout is a server setting, not a bind parameter; the value is a validated integer.
-    await client.query(`SET LOCAL lock_timeout = '${lockTimeout}ms'`);
-    const result = await fn(executor(client));
-    await client.query("COMMIT");
-    return result;
-  } catch (error) {
+    let result: T;
     try {
-      await client.query("ROLLBACK");
-    } catch {
-      broken = true;
+      await client.query("BEGIN");
+      // lock_timeout is a server setting, not a bind parameter; the value is a validated
+      // integer.
+      await client.query(`SET LOCAL lock_timeout = '${lockTimeout}ms'`);
+    } catch (error) {
+      // ROLLBACK here is for the client's sake: on a dead connection it fails and marks
+      // the client broken, so it is destroyed instead of going back to the pool.
+      await rollback();
+      throw unavailable(error);
     }
-    throw error;
+    try {
+      result = await fn(executor(client));
+    } catch (error) {
+      await rollback();
+      throw error;
+    }
+    try {
+      await client.query("COMMIT");
+    } catch (error) {
+      await rollback();
+      // An error the server returned for COMMIT means it aborted the transaction. Anything
+      // else (socket closed, client no longer queryable) means COMMIT got no answer.
+      throw isServerError(error)
+        ? new IdemfenceStoreError(
+            "COMMIT_REJECTED",
+            "The server rejected COMMIT; the transaction was rolled back.",
+            { cause: error },
+          )
+        : new IdemfenceStoreError(
+            "COMMIT_UNKNOWN",
+            "The connection failed during COMMIT; the transaction may or may not have committed.",
+            { cause: error },
+          );
+    }
+    return result;
   } finally {
     client.removeListener("error", onError);
     // release(true) destroys the client rather than returning it to the pool.
     client.release(broken);
   }
+
+  async function rollback(): Promise<void> {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      broken = true;
+    }
+  }
+}
+
+function unavailable(error: unknown): IdemfenceStoreError {
+  return new IdemfenceStoreError(
+    "TRANSACTION_UNAVAILABLE",
+    "A transaction could not be opened; nothing ran.",
+    { cause: error },
+  );
+}
+
+/** pg surfaces errors the server returned with a severity and a five-character SQLSTATE. */
+function isServerError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const { severity, code } = error as { severity?: unknown; code?: unknown };
+  return (
+    typeof severity === "string" &&
+    typeof code === "string" &&
+    /^[0-9A-Z]{5}$/.test(code)
+  );
 }
 
 /** Exposes only `query`, so the handler cannot release the pooled client. */

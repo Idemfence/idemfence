@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { IdemfenceConfigError } from "../src/config.js";
@@ -179,11 +180,18 @@ describe("withTransaction", () => {
           const pid = (
             await tx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
           ).rows[0]?.pid;
-          const sleeping = tx.query("SELECT pg_sleep(5)");
+          // The handler is attached before yielding: the kill can reject the query while
+          // the terminate round trip is still in flight.
+          const sleeping = tx.query("SELECT pg_sleep(5)").then(
+            () => "resolved",
+            (error: unknown) => error,
+          );
           await observer.query("SELECT pg_terminate_backend($1)", [pid]);
-          await sleeping;
+          const settled = await sleeping;
+          expect(settled).toMatchObject({ code: "57P01" });
+          throw new Error("backend gone");
         }),
-      ).rejects.toThrow();
+      ).rejects.toThrow("backend gone");
 
       // The broken connection was destroyed, not put back for the next caller.
       expect({ total: own.totalCount, idle: own.idleCount }).toEqual({
@@ -216,6 +224,172 @@ describe("withTransaction", () => {
     expect(() => postgresStore({ pool, schema, lockTimeout: "0ms" })).toThrow(
       IdemfenceConfigError,
     );
+  });
+});
+
+describe("withTransaction when the backend dies", () => {
+  it("leaves no unhandled error, no pool error and no broken client, wherever the kill lands", async () => {
+    const uncaught: unknown[] = [];
+    const onUncaught = (error: unknown) => {
+      uncaught.push(error);
+    };
+    process.on("uncaughtException", onUncaught);
+    const own = new pg.Pool({ connectionString: url, max: 1 });
+    const poolErrors: unknown[] = [];
+    own.on("error", (error) => {
+      poolErrors.push(error);
+    });
+    const terminate = async (pid: number | undefined) => {
+      await observer.query("SELECT pg_terminate_backend($1)", [pid]);
+    };
+    const pidOf = async (tx: SqlExecutor) =>
+      (await tx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid"))
+        .rows[0]?.pid;
+
+    const scenarios: Record<string, () => Promise<unknown>> = {
+      // The kill is issued as soon as the client is handed out, racing BEGIN and SET LOCAL.
+      "before BEGIN completes": () => {
+        let killed: Promise<void> | undefined;
+        own.once("acquire", (client) => {
+          killed = terminate((client as { processID?: number }).processID);
+        });
+        return withTransaction(own, {}, async (tx) => {
+          await killed;
+          await tx.query("SELECT 1");
+        });
+      },
+      "between statements": () =>
+        withTransaction(own, {}, async (tx) => {
+          await terminate(await pidOf(tx));
+          await sleep(20);
+          await tx.query("SELECT 1");
+        }),
+      "mid-statement": () =>
+        withTransaction(own, {}, async (tx) => {
+          const pid = await pidOf(tx);
+          const sleeping = tx.query("SELECT pg_sleep(5)").then(
+            () => "resolved",
+            (error: unknown) => error,
+          );
+          await terminate(pid);
+          expect(await sleeping).toMatchObject({ code: "57P01" });
+          throw new Error("backend gone");
+        }),
+      "during COMMIT": () =>
+        withTransaction(own, {}, async (tx) => {
+          await terminate(await pidOf(tx));
+        }),
+    };
+
+    try {
+      for (let round = 0; round < 8; round += 1) {
+        for (const [name, run] of Object.entries(scenarios)) {
+          await expect(run(), `${name} #${round}`).rejects.toThrow();
+          await sleep(30);
+          expect(
+            {
+              name,
+              round,
+              total: own.totalCount,
+              idle: own.idleCount,
+              uncaught: uncaught.length,
+              poolErrors: poolErrors.length,
+            },
+            `${name} #${round}`,
+          ).toEqual({
+            name,
+            round,
+            total: 0,
+            idle: 0,
+            uncaught: 0,
+            poolErrors: 0,
+          });
+          const fresh = await own.query<{ n: number }>("SELECT 1::int AS n");
+          expect(fresh.rows[0]?.n).toBe(1);
+        }
+      }
+    } finally {
+      process.off("uncaughtException", onUncaught);
+      await own.end();
+    }
+  });
+});
+
+describe("withTransaction error classification", () => {
+  it("TRANSACTION_UNAVAILABLE when the transaction cannot be opened", async () => {
+    const dead = new pg.Pool({
+      host: "127.0.0.1",
+      port: 1,
+      database: "none",
+      user: "none",
+      password: "none",
+      connectionTimeoutMillis: 500,
+    });
+    dead.on("error", () => {});
+    try {
+      await expect(withTransaction(dead, {}, async () => {})).rejects.toEqual(
+        expect.objectContaining({
+          name: "IdemfenceStoreError",
+          code: "TRANSACTION_UNAVAILABLE",
+          cause: expect.any(Error),
+        }),
+      );
+    } finally {
+      await dead.end();
+    }
+  });
+
+  it("COMMIT_REJECTED when the server answers COMMIT with an error (definite rollback)", async () => {
+    await pool.query(
+      `CREATE TABLE "${schema}".deferred (id int UNIQUE DEFERRABLE INITIALLY DEFERRED)`,
+    );
+    await expect(
+      withTransaction(pool, {}, async (tx) => {
+        await tx.query(`INSERT INTO "${schema}".deferred (id) VALUES (1), (1)`);
+      }),
+    ).rejects.toEqual(
+      expect.objectContaining({
+        name: "IdemfenceStoreError",
+        code: "COMMIT_REJECTED",
+        cause: expect.objectContaining({ code: "23505" }),
+      }),
+    );
+    expect(
+      (
+        await observer.query(
+          `SELECT count(*)::int AS n FROM "${schema}".deferred`,
+        )
+      ).rows[0]?.n,
+    ).toBe(0);
+  });
+
+  it("COMMIT_UNKNOWN when the connection fails during COMMIT (outcome ambiguous)", async () => {
+    const own = new pg.Pool({ connectionString: url, max: 1 });
+    own.on("error", () => {});
+    try {
+      await expect(
+        withTransaction(own, {}, async (tx) => {
+          const pid = (
+            await tx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+          ).rows[0]?.pid;
+          await observer.query("SELECT pg_terminate_backend($1)", [pid]);
+          // Let the client process the FATAL before COMMIT is attempted.
+          await sleep(50);
+        }),
+      ).rejects.toEqual(
+        expect.objectContaining({
+          name: "IdemfenceStoreError",
+          code: "COMMIT_UNKNOWN",
+          cause: expect.any(Error),
+        }),
+      );
+      expect({ total: own.totalCount, idle: own.idleCount }).toEqual({
+        total: 0,
+        idle: 0,
+      });
+    } finally {
+      await own.end();
+    }
   });
 });
 

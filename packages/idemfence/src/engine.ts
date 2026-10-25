@@ -12,10 +12,11 @@ import {
   type ProblemKind,
   problemResponse,
 } from "./problem.js";
-import type {
-  SqlExecutor,
-  StoredResponse,
-  TransactionalStore,
+import {
+  IdemfenceStoreError,
+  type SqlExecutor,
+  type StoredResponse,
+  type TransactionalStore,
 } from "./store.js";
 
 /** Thrown by `ctx.renew()` when another attempt has taken the lease over (contract row 9). */
@@ -88,6 +89,12 @@ const bodyTooLargeResponses = new WeakSet<Response>();
 export function isBodyTooLargeResponse(response: Response): boolean {
   return bodyTooLargeResponses.has(response);
 }
+
+type HandlerOutcome =
+  | { kind: "response"; response: Response }
+  | { kind: "threw"; error: unknown }
+  /** Transactional mode only: the transaction could not be opened or committed. */
+  | { kind: "unavailable"; error: unknown };
 
 const passthroughContext: HandlerContext = {
   async renew() {},
@@ -263,65 +270,85 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       },
     };
 
+    let outcome: HandlerOutcome;
+    if (route.mode === "transactional") {
+      // The handler runs inside one store transaction and sees it as ctx.tx; a throw rolls
+      // its writes back. Writing the record inside that transaction (contract rows 11 and
+      // 13) is not implemented yet: the record still follows lease mode.
+      outcome = await inTransaction(request, handler, ctx);
+      if (outcome.kind === "unavailable") {
+        // Row 14, both ways a 503 with Retry-After rather than a stored 500, which would be
+        // replayed for an operation that never ran.
+        if (isCommitUnknown(outcome.error)) {
+          // The connection failed during COMMIT with no answer from the server: the
+          // handler's writes may or may not have landed. The lease is kept so a retry
+          // waits (row 8) until it expires; the record lives outside the transaction until
+          // 2.2 moves it inside, which resolves this ambiguity.
+          logger.error(
+            "idemfence: connection failed during COMMIT; outcome unknown, lease kept",
+            {
+              keyHash,
+              row: 14,
+              outcome: "commit-unknown",
+              error: errorInfo(outcome.error),
+            },
+          );
+          return problem(route, "store-unavailable");
+        }
+        // The transaction could not be opened, or the server rejected COMMIT: the
+        // handler's work never happened, so the key is freed for a retry.
+        logger.error(
+          "idemfence: transaction could not be opened or committed; nothing was applied",
+          {
+            keyHash,
+            row: 14,
+            outcome: "store-unavailable",
+            error: errorInfo(outcome.error),
+          },
+        );
+        await releaseLease(key, fencingToken, keyHash, 14);
+        return problem(route, "store-unavailable");
+      }
+    } else {
+      try {
+        outcome = { kind: "response", response: await handler(request, ctx) };
+      } catch (error) {
+        outcome = { kind: "threw", error };
+      }
+    }
+
     let response: Response;
-    let threw = false;
-    try {
-      // Transactional mode: the handler runs inside one store transaction and sees it as
-      // ctx.tx; a throw rolls its writes back. Writing the record inside that transaction
-      // (contract rows 11 and 13) is not implemented yet: the record still follows lease mode.
-      response =
-        route.mode === "transactional"
-          ? await (store as TransactionalStore).transaction((tx) =>
-              handler(request, { ...ctx, tx }),
-            )
-          : await handler(request, ctx);
-    } catch (error) {
-      threw = true;
+    const threw = outcome.kind === "threw";
+    if (outcome.kind === "threw") {
       // Row 12: side effects may have happened, so the failure is stored and replayed.
       logger.error("idemfence: handler threw; storing a 500 problem", {
         keyHash,
         row: 12,
         outcome: "handler-error",
-        error: errorInfo(error),
+        error: errorInfo(outcome.error),
       });
       response = internalProblemResponse();
+    } else {
+      response = outcome.response;
     }
 
     // Row 11 applies only to a response the handler returned: a throw is always stored
     // (row 12), even when 500 is a release status.
     if (!threw && route.releaseStatuses.includes(response.status)) {
-      try {
-        if ((await store.release(key, fencingToken)) === "fenced") {
-          logger.warn("idemfence: release was fenced", {
-            keyHash,
-            row: 9,
-            outcome: "fenced",
-          });
-        }
-      } catch (error) {
-        logger.error(
-          "idemfence: release failed; the lease will expire on its own",
-          {
-            keyHash,
-            row: 11,
-            outcome: "store_error",
-            error: errorInfo(error),
-          },
-        );
-      }
+      await releaseLease(key, fencingToken, keyHash, 11);
       return response;
     }
 
     // Rows 5, 9 and 12: store-then-send.
     const captured = await capture(response, route, keyHash);
-    const outcome = await completeWithRetries(
+    const completed = await completeWithRetries(
       key,
       fencingToken,
       captured.stored,
       keyHash,
       row,
     );
-    if (outcome === "fenced") {
+    if (completed === "fenced") {
       logger.warn(
         "idemfence: complete was fenced; sending the handler's response unstored",
         {
@@ -332,6 +359,64 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       );
     }
     return captured.send;
+  }
+
+  /**
+   * Runs the handler inside the store's transaction. The handler's own throw is recorded
+   * before it propagates, so anything else escaping `transaction()` is the store failing to
+   * open or commit it.
+   */
+  async function inTransaction(
+    request: Request,
+    handler: Handler,
+    ctx: HandlerContext,
+  ): Promise<HandlerOutcome> {
+    let threw: { error: unknown } | undefined;
+    try {
+      const response = await (store as TransactionalStore).transaction(
+        async (tx) => {
+          try {
+            return await handler(request, { ...ctx, tx });
+          } catch (error) {
+            threw = { error };
+            throw error;
+          }
+        },
+      );
+      return { kind: "response", response };
+    } catch (error) {
+      return threw === undefined
+        ? { kind: "unavailable", error }
+        : { kind: "threw", error: threw.error };
+    }
+  }
+
+  /** Deletes the in-flight record so the key can be retried; a failure only logs. */
+  async function releaseLease(
+    key: Uint8Array,
+    fencingToken: bigint,
+    keyHash: string,
+    row: number,
+  ): Promise<void> {
+    try {
+      if ((await store.release(key, fencingToken)) === "fenced") {
+        logger.warn("idemfence: release was fenced", {
+          keyHash,
+          row: 9,
+          outcome: "fenced",
+        });
+      }
+    } catch (error) {
+      logger.error(
+        "idemfence: release failed; the lease will expire on its own",
+        {
+          keyHash,
+          row,
+          outcome: "store_error",
+          error: errorInfo(error),
+        },
+      );
+    }
   }
 
   async function completeWithRetries(
@@ -516,6 +601,12 @@ function concat(
     offset += chunk.byteLength;
   }
   return body;
+}
+
+function isCommitUnknown(error: unknown): boolean {
+  return (
+    error instanceof IdemfenceStoreError && error.code === "COMMIT_UNKNOWN"
+  );
 }
 
 function hashPrefix(key: Uint8Array): string {
