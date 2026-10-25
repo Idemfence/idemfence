@@ -1578,14 +1578,23 @@ export function formatConcurrency(
 // Crash group
 // ---------------------------------------------------------------------------------------
 
+// Lease mode times every bound from sentAt, the moment the crash request is sent, which is
+// when the killed attempt's lease begins (give or take the request's latency). A retry's
+// time is taken when it is sent, so a handler's own work never counts.
+
 /**
- * Lease mode: how much longer than the lease, counted from the moment the restarted target
- * is ready, the suite may keep getting 409s before a retry is answered otherwise (the time
- * is taken when that retry is sent, so the handler's own work does not count). It covers
- * the retry pacing, request latency and the target's database clock against this
+ * Lease mode: how much later than the lease, counted from sentAt, the first retry answered
+ * otherwise than 409 may be sent. It covers the retry pacing, request latency, a renewal
+ * the killed attempt may have made, and the target's database clock against this
  * machine's.
  */
 export const CRASH_SLACK_MS = 3_000;
+/**
+ * Lease mode: how much earlier than the lease, counted from sentAt, the restarted target
+ * must be ready (so the 409 window is observed at all), and the earliest a retry answered
+ * otherwise may be sent (a target that frees the key sooner did not honour the lease).
+ */
+export const CRASH_EARLY_SLACK_MS = 1_000;
 /** How long after sending the crash request the target is killed. */
 export const CRASH_KILL_AFTER_MS = 500;
 const CRASH_COMMAND_TIMEOUT_MS = 120_000;
@@ -1603,9 +1612,11 @@ export interface CrashResult {
   conflicts: number;
   /** From the kill command to the restarted target answering readyPath. */
   restartMs: number;
+  /** From sending the crash request to the restarted target answering readyPath. */
+  readyMs: number;
   /**
-   * From the restarted target being ready to sending the first request that was not
-   * answered 409.
+   * From sending the crash request to sending the first retry answered otherwise than 409;
+   * null when there was none.
    */
   firstSuccessMs: number | null;
   durationMs: number;
@@ -1615,11 +1626,16 @@ export interface CrashResult {
 /**
  * Runs the Crash group: sends the crash fixture, kills the target CRASH_KILL_AFTER_MS later
  * with `crash.kill`, restarts it with `crash.start`, waits for `crash.readyPath`, and retries
- * with the same key and body. Lease mode: the retries are 409s with Retry-After until a
- * non-409 arrives within the lease plus CRASH_SLACK_MS, between the restart and that answer
- * the count rises by exactly 1, and a further retry replays. Transactional mode: the first
- * retry succeeds, the count rises by exactly 1 over the whole scenario, and a further retry
- * replays.
+ * with the same key and body.
+ *
+ * Lease mode, all times from sending the crash request: the target must be ready again
+ * before lease - CRASH_EARLY_SLACK_MS, or the window cannot be observed and the group fails;
+ * at least one retry must be a 409 with Retry-After; the first retry answered otherwise must
+ * be sent between lease - CRASH_EARLY_SLACK_MS and lease + CRASH_SLACK_MS and be a fresh
+ * 2xx; between the restart and it the count rises by exactly 1; a further retry replays.
+ *
+ * Transactional mode: the first retry after the restart succeeds, the count rises by exactly
+ * 1 over the whole scenario, and a further retry replays.
  */
 export async function runCrashGroup(
   baseUrl: string,
@@ -1702,6 +1718,8 @@ export async function runCrashGroup(
   const startedAt = Date.now();
   const key = newKey();
   const before = await readCount();
+  // The killed attempt's lease starts about now.
+  const sentAt = Date.now();
   const killed = client.send(fixture, { key }).then(
     (reply) => reply,
     (error: unknown) => error,
@@ -1724,23 +1742,50 @@ export async function runCrashGroup(
   await ready();
   const readyAt = Date.now();
   const restartMs = readyAt - killedAt;
+  const readyMs = readyAt - sentAt;
   const atRestart = await readCount();
 
   let conflicts = 0;
   let first: Reply | undefined;
   let firstSuccessMs: number | null = null;
+  const result = (): CrashResult => ({
+    group: "crash",
+    mode: config.mode,
+    messages: check.messages,
+    notes,
+    conflicts,
+    restartMs,
+    readyMs,
+    firstSuccessMs,
+    durationMs: Date.now() - startedAt,
+    ok: check.outcome === "pass",
+  });
+
   if (config.mode === "lease") {
     const leaseMs = crash.leaseMs ?? 0;
+    const earliest = leaseMs - CRASH_EARLY_SLACK_MS;
+    const latest = leaseMs + CRASH_SLACK_MS;
+    notes.push(
+      `lease ${leaseMs} ms from the crash request; ready again ${readyMs} ms after it (${restartMs} ms after the kill); a retry may first be answered otherwise between ${earliest} and ${latest} ms after it`,
+    );
+    // (a) The window must be observable: a target back after its lease expired would pass
+    // without ever showing a 409.
+    if (readyMs >= earliest) {
+      check.that(
+        false,
+        `the target was ready again ${readyMs} ms after the crash request (${restartMs} ms after the kill), not before lease - ${CRASH_EARLY_SLACK_MS} ms = ${earliest} ms, so the lease window cannot be observed: the lease must be longer, at least ${readyMs + CRASH_EARLY_SLACK_MS} ms here`,
+      );
+      return result();
+    }
     notes.push(
       `the killed attempt's write survived the crash: the count rose by ${atRestart - before} before the restart`,
     );
     for (;;) {
-      // Measured when the request leaves, so the handler's own work is not counted.
-      const sentAfterReady = Date.now() - readyAt;
+      const sentMs = Date.now() - sentAt;
       const reply = await client.send(fixture, { key });
       if (reply.status !== 409) {
         first = reply;
-        firstSuccessMs = sentAfterReady;
+        firstSuccessMs = sentMs;
         break;
       }
       conflicts += 1;
@@ -1753,16 +1798,36 @@ export async function runCrashGroup(
       for (const message of sub.messages) {
         check.that(false, `retry ${conflicts}: ${message}`);
       }
-      if (Date.now() - readyAt > leaseMs + CRASH_SLACK_MS) {
+      // (d) The window must close.
+      if (Date.now() - sentAt > latest) {
         check.that(
           false,
-          `still 409 more than lease (${leaseMs} ms) + ${CRASH_SLACK_MS} ms after the restart`,
+          `still 409 more than lease + ${CRASH_SLACK_MS} ms = ${latest} ms after the crash request`,
         );
         break;
       }
       await sleep(CRASH_RETRY_PAUSE_MS);
     }
+    notes.push(
+      `${conflicts} x 409, then the first retry answered otherwise was sent ${firstSuccessMs === null ? "never" : `${firstSuccessMs} ms after the crash request`}`,
+    );
     if (first !== undefined) {
+      // (b) The killed attempt's lease must be honoured, not ignored.
+      check.that(
+        conflicts >= 1,
+        "no 409 before the first success: the target ran the request again at once instead of honouring the killed attempt's lease",
+      );
+      // (c) Nor cut short.
+      check.that(
+        (firstSuccessMs ?? 0) >= earliest,
+        `the first retry answered otherwise was sent ${firstSuccessMs} ms after the crash request, before lease - ${CRASH_EARLY_SLACK_MS} ms = ${earliest} ms: the target freed the key before the killed attempt's lease expired`,
+      );
+      // (d)
+      check.that(
+        (firstSuccessMs ?? 0) <= latest,
+        `the first retry answered otherwise was sent ${firstSuccessMs} ms after the crash request, after lease + ${CRASH_SLACK_MS} ms = ${latest} ms`,
+      );
+      // (e)
       check.that(
         first.status >= 200 && first.status < 300,
         `the first answer after the 409s should be a 2xx, got ${first.status}`,
@@ -1771,10 +1836,6 @@ export async function runCrashGroup(
         !replayed(first),
         "the first answer after the 409s must be a fresh execution, not a replay",
       );
-      check.that(
-        (firstSuccessMs ?? 0) <= leaseMs + CRASH_SLACK_MS,
-        `the first request answered with a non-409 was sent ${firstSuccessMs} ms after the restart, over lease (${leaseMs} ms) + ${CRASH_SLACK_MS} ms`,
-      );
       const after = await readCount();
       check.that(
         after - atRestart === 1,
@@ -1782,7 +1843,10 @@ export async function runCrashGroup(
       );
     }
   } else {
-    firstSuccessMs = Date.now() - readyAt;
+    notes.push(
+      `ready again ${readyMs} ms after the crash request (${restartMs} ms after the kill)`,
+    );
+    firstSuccessMs = Date.now() - sentAt;
     first = await client.send(fixture, { key });
     check.that(
       first.status >= 200 && first.status < 300,
@@ -1811,24 +1875,14 @@ export async function runCrashGroup(
     );
   }
 
-  return {
-    group: "crash",
-    mode: config.mode,
-    messages: check.messages,
-    notes,
-    conflicts,
-    restartMs,
-    firstSuccessMs,
-    durationMs: Date.now() - startedAt,
-    ok: check.outcome === "pass",
-  };
+  return result();
 }
 
 export function formatCrash(baseUrl: string, result: CrashResult): string {
   const lines = [
     `idemfence conformance, Crash group, target ${baseUrl}, ${result.mode} mode`,
-    `  killed ${CRASH_KILL_AFTER_MS} ms into the request; ready again ${result.restartMs} ms after the kill`,
-    `  retries after the restart: ${result.conflicts} x 409, then the first request answered otherwise was sent ${result.firstSuccessMs === null ? "never" : `${result.firstSuccessMs} ms after the restart`}`,
+    `  killed ${CRASH_KILL_AFTER_MS} ms into the request; ready again ${result.restartMs} ms after the kill, ${result.readyMs} ms after the crash request`,
+    `  retries after the restart: ${result.conflicts} x 409, then the first retry answered otherwise was sent ${result.firstSuccessMs === null ? "never" : `${result.firstSuccessMs} ms after the crash request`}`,
   ];
   for (const note of result.notes) {
     lines.push(`  note: ${note}`);
