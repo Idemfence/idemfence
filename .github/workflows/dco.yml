@@ -59,3 +59,43 @@ jobs:
             echo "Fix with 'git rebase --signoff ${BASE_SHA}' and force-push."
             exit 1
           fi
+
+      - name: Check for tool attribution trailers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          failed=0
+          for sha in $(git rev-list --reverse "${BASE_SHA}..${HEAD_SHA}"); do
+            # Flag a Co-authored-by trailer naming Claude or carrying an @anthropic.com email, and
+            # any "Generated with Claude Code" text. Matching is case-insensitive.
+            hits=$(git log -1 --format=%B "${sha}" | awk '
+              {
+                low = tolower($0)
+                if (low ~ /generated with claude code/) { print; next }
+                if (low !~ /^[[:space:]]*co-authored-by:/) next
+                value = substr(low, index(low, ":") + 1)
+                name = value
+                sub(/<.*/, "", name)
+                email = ""
+                if (match(value, /<[^>]*>/)) email = substr(value, RSTART + 1, RLENGTH - 2)
+                if (name ~ /claude/ || email ~ /@anthropic\.com$/) print
+              }')
+            if [ -z "${hits}" ]; then
+              echo "ok      ${sha}"
+              continue
+            fi
+            while IFS= read -r line; do
+              echo "found   ${sha} ${line}"
+              echo "::error::Commit ${sha} carries a tool attribution line: ${line}"
+            done <<< "${hits}"
+            failed=1
+          done
+
+          if [ "${failed}" -ne 0 ]; then
+            echo
+            echo "Drop each listed line from its commit message (git commit --amend for the last commit, or 'git rebase -i ${BASE_SHA}' and reword), keep the Signed-off-by trailer, and force-push."
+            exit 1
+          fi
