@@ -1,8 +1,13 @@
 import { IdemfenceConfigError, type RouteConfig } from "./config.js";
-import { type Handler, isBodyTooLargeResponse } from "./engine.js";
+import {
+  type Handler,
+  isBodyTooLargeResponse,
+  passthroughContext,
+} from "./engine.js";
 import type { Idemfence } from "./index.js";
 
 export type {
+  DeriveKey,
   Handler,
   HandlerContext,
   LeaseHandlerContext,
@@ -51,10 +56,6 @@ export function idempotent(
     return response;
   };
 }
-
-const passthroughContext = {
-  async renew() {},
-};
 
 function validMethods(value: unknown): readonly string[] {
   const methods = value ?? DEFAULT_METHODS;

@@ -2,6 +2,7 @@ import type { ResolvedConfig } from "./config.js";
 
 const LOOKUP_TAG = "idemfence/lookup/v1";
 const FINGERPRINT_TAG = "idemfence/fingerprint/v1";
+const DERIVE_TAG = "idemfence/derive/v1";
 
 type FingerprintConfig = Pick<
   ResolvedConfig,
@@ -34,6 +35,39 @@ export async function lookupKey(input: LookupKeyInput): Promise<Uint8Array> {
       input.clientKey,
     ]),
   );
+}
+
+/**
+ * The non-extractable HMAC-SHA256 key for derived downstream keys (docs/contract.md
+ * section 5), imported from the oldest configured secret. Import it once and reuse it.
+ */
+export function deriveHmacKey(secret: Uint8Array): Promise<CryptoKey> {
+  return globalThis.crypto.subtle.importKey(
+    "raw",
+    new Uint8Array(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+}
+
+/**
+ * A derived downstream key (docs/contract.md section 5): lowercase hex of HMAC-SHA256 over
+ * the length-prefixed domain tag, lookup key and label.
+ */
+export async function derivedKey(
+  hmacKey: CryptoKey,
+  lookup: Uint8Array,
+  label: string,
+): Promise<string> {
+  const mac = new Uint8Array(
+    await globalThis.crypto.subtle.sign(
+      "HMAC",
+      hmacKey,
+      encode([DERIVE_TAG, lookup, label]),
+    ),
+  );
+  return Array.from(mac, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /**

@@ -122,6 +122,7 @@ try {
       JSON.stringify({
         root: [
           "IdemfenceConfigError",
+          "IdemfenceDeriveError",
           "IdemfenceFencedError",
           "IdemfenceStoreError",
           "createIdemfence",

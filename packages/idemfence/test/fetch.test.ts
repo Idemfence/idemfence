@@ -630,6 +630,7 @@ describe("the built package", () => {
     expect(JSON.parse(stdout)).toStrictEqual({
       root: [
         "IdemfenceConfigError",
+        "IdemfenceDeriveError",
         "IdemfenceFencedError",
         "IdemfenceStoreError",
         "createIdemfence",

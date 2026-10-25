@@ -112,7 +112,16 @@ export interface IdemfenceOptions<TRequest = unknown> {
   store: Store;
   /** Returns the principal that owns the key; `undefined` when there is none (contract row 4). */
   scope: (request: TRequest) => string | undefined;
+  /** The current secret: at least 32 bytes (strings count UTF-8 bytes). */
   secret: string | Uint8Array;
+  /**
+   * Earlier secrets, newest first and oldest last. Derived downstream keys
+   * (`ctx.deriveKey`) use the oldest configured secret: the last entry here, or `secret`
+   * when this is empty. To rotate, set the new value as `secret` and put the old one at
+   * the front of this list; no derived key changes. Removing the last (oldest) entry is a
+   * deliberate re-key: every derived key changes, and a request whose attempts straddle the
+   * removal gets a new downstream key on its later attempts.
+   */
   previousSecrets?: readonly (string | Uint8Array)[];
   docsUrl: string;
   retention?: Duration;
