@@ -1,7 +1,11 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import { createIdemfence, IdemfenceConfigError } from "idemfence";
+import {
+  createIdemfence,
+  type Idemfence,
+  IdemfenceConfigError,
+} from "idemfence";
 import { idempotent } from "idemfence/fetch";
 import { postgresStore } from "idemfence/postgres";
 import pg from "pg";
@@ -46,7 +50,9 @@ function readConfig(env: NodeJS.ProcessEnv): Config {
 // The conformance suite identifies the caller with an X-Principal header. A real application
 // MUST derive the principal from its authentication (session, token, API key), never from a
 // header the client controls: with a client-chosen principal, anyone could replay or block
-// another caller's keys.
+// another caller's keys. A real application also rejects unauthenticated requests before
+// idemfence runs (401); this app deliberately lets a missing header reach idemfence so the
+// conformance suite can verify contract row 4.
 const PRINCIPAL = /^[\x21-\x7e]{1,64}$/;
 
 let config: Config;
@@ -62,13 +68,27 @@ pool.on("error", (error) => {
   console.error("pg pool error", { name: error.name, message: error.message });
 });
 
-let idem: ReturnType<typeof createIdemfence>;
+const store = postgresStore({ pool });
+const scope = (request: Request) =>
+  request.headers.get("x-principal") ?? undefined;
+
+let idem: Idemfence;
+let shortRetentionIdem: Idemfence;
 try {
   idem = createIdemfence({
-    store: postgresStore({ pool }),
-    scope: (request) => request.headers.get("x-principal") ?? undefined,
+    store,
+    scope,
     secret: config.secret,
     docsUrl: config.docsUrl,
+  });
+  // The short-retention fixture (contract row 10) needs its own lease and retention.
+  shortRetentionIdem = createIdemfence({
+    store,
+    scope,
+    secret: config.secret,
+    docsUrl: config.docsUrl,
+    lease: "500ms",
+    retention: "1500ms",
   });
 } catch (error) {
   if (error instanceof IdemfenceConfigError) {
@@ -80,29 +100,7 @@ try {
   throw error;
 }
 
-const app = new Hono();
-
-app.get("/healthz", async (c) => {
-  try {
-    await idem.ready();
-    return c.json({ status: "ok" });
-  } catch (error) {
-    return c.json(
-      {
-        status: "unavailable",
-        reason: error instanceof Error ? error.name : "unknown",
-      },
-      503,
-    );
-  }
-});
-
-app.get("/orders/count", async (c) => {
-  const result = await pool.query<{ count: number }>(
-    "SELECT count(*)::int AS count FROM orders",
-  );
-  return c.json({ count: result.rows[0]?.count ?? 0 });
-});
+// --- Orders -------------------------------------------------------------------------------
 
 interface CreateOrder {
   item: string;
@@ -131,40 +129,77 @@ function parseCreateOrder(body: unknown): CreateOrder | string {
   return { item, simulateWorkMs: (simulateWorkMs as number | undefined) ?? 0 };
 }
 
-const createOrder = idempotent(
-  idem,
-  { routeTemplate: "/orders" },
-  async (request) => {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return Response.json(
-        { error: "body must be valid JSON" },
-        { status: 400 },
-      );
-    }
-    const order = parseCreateOrder(body);
-    if (typeof order === "string") {
-      return Response.json({ error: order }, { status: 400 });
-    }
-    const inserted = await pool.query<{ id: string }>(
-      "INSERT INTO orders (item) VALUES ($1) RETURNING id::text AS id",
-      [order.item],
-    );
-    if (order.simulateWorkMs > 0) {
-      await sleep(order.simulateWorkMs);
-    }
-    return Response.json(
-      { id: Number(inserted.rows[0]?.id), item: order.item },
-      { status: 201 },
-    );
-  },
-);
+/** Inserts one order, waits the simulated work, returns 201 { id, item }. */
+async function createOrderHandler(request: Request): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "body must be valid JSON" }, { status: 400 });
+  }
+  const order = parseCreateOrder(body);
+  if (typeof order === "string") {
+    return Response.json({ error: order }, { status: 400 });
+  }
+  const inserted = await pool.query<{ id: string }>(
+    "INSERT INTO orders (item) VALUES ($1) RETURNING id::text AS id",
+    [order.item],
+  );
+  if (order.simulateWorkMs > 0) {
+    await sleep(order.simulateWorkMs);
+  }
+  return Response.json(
+    { id: Number(inserted.rows[0]?.id), item: order.item },
+    { status: 201 },
+  );
+}
 
-app.post("/orders", async (c) => {
-  const principal = c.req.header("x-principal") ?? "";
-  if (!PRINCIPAL.test(principal)) {
+async function releaseHandler(): Promise<Response> {
+  return new Response("later", {
+    status: 429,
+    headers: { "retry-after": "1" },
+  });
+}
+
+async function throwsHandler(): Promise<Response> {
+  throw new Error("the fixture handler always throws");
+}
+
+async function passthroughHandler(request: Request): Promise<Response> {
+  return Response.json({ echo: await request.text() });
+}
+
+// --- Routes -------------------------------------------------------------------------------
+
+const app = new Hono();
+
+app.get("/healthz", async (c) => {
+  try {
+    await idem.ready();
+    return c.json({ status: "ok" });
+  } catch (error) {
+    return c.json(
+      {
+        status: "unavailable",
+        reason: error instanceof Error ? error.name : "unknown",
+      },
+      503,
+    );
+  }
+});
+
+app.get("/orders/count", async (c) => {
+  const result = await pool.query<{ count: number }>(
+    "SELECT count(*)::int AS count FROM orders",
+  );
+  return c.json({ count: result.rows[0]?.count ?? 0 });
+});
+
+// An X-Principal that is present but malformed is a client error; a missing one reaches
+// idemfence (see the note on PRINCIPAL above).
+app.use("*", async (c, next) => {
+  const principal = c.req.header("x-principal");
+  if (principal !== undefined && !PRINCIPAL.test(principal)) {
     return c.json(
       {
         error:
@@ -173,8 +208,46 @@ app.post("/orders", async (c) => {
       400,
     );
   }
-  return await createOrder(c.req.raw);
+  await next();
 });
+
+// Idempotent routes: the main endpoint and the conformance fixtures.
+const createOrder = idempotent(
+  idem,
+  { routeTemplate: "/orders" },
+  createOrderHandler,
+);
+const release = idempotent(
+  idem,
+  { routeTemplate: "/fixtures/release" },
+  releaseHandler,
+);
+const throws = idempotent(
+  idem,
+  { routeTemplate: "/fixtures/throws" },
+  throwsHandler,
+);
+const shortRetention = idempotent(
+  shortRetentionIdem,
+  { routeTemplate: "/fixtures/short-retention" },
+  createOrderHandler,
+);
+app.post("/orders", (c) => createOrder(c.req.raw));
+app.post("/fixtures/release", (c) => release(c.req.raw));
+app.post("/fixtures/throws", (c) => throws(c.req.raw));
+app.post("/fixtures/short-retention", (c) => shortRetention(c.req.raw));
+// Not idempotent on purpose: contract row 1 (passthrough).
+app.post("/fixtures/passthrough", (c) => passthroughHandler(c.req.raw));
+
+// Deliberately NON-conforming: the same handlers with no idemfence, so the conformance
+// suite can be shown failing. Never do this in a real application.
+const nonconforming = new Hono();
+nonconforming.post("/orders", (c) => createOrderHandler(c.req.raw));
+nonconforming.post("/release", () => releaseHandler());
+nonconforming.post("/throws", () => throwsHandler());
+nonconforming.post("/short-retention", (c) => createOrderHandler(c.req.raw));
+nonconforming.post("/passthrough", (c) => passthroughHandler(c.req.raw));
+app.route("/nonconforming", nonconforming);
 
 const server = serve(
   { fetch: app.fetch, port: config.port, hostname: "0.0.0.0" },

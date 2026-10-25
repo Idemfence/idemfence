@@ -13,13 +13,36 @@ idemfence into an application.
 | `GET /orders/count` | `{ "count": n }`: the number of rows in `orders`. |
 | `GET /healthz` | `200` once idemfence's `ready()` has verified the schema, otherwise `503`. |
 
+### Conformance fixtures
+
+These routes exist for the conformance suite (`packages/conformance`) and stay permanently:
+
+| Method and path | Behaviour |
+| --------------- | --------- |
+| `POST /fixtures/release` | Idempotent; always answers `429` (a release status), so the key stays reusable (row 11). |
+| `POST /fixtures/throws` | Idempotent; the handler throws (row 12). |
+| `POST /fixtures/short-retention` | Idempotent with a 500 ms lease and 1.5 s retention; same body and effect as `POST /orders` (row 10). |
+| `POST /fixtures/passthrough` | Not idempotent; echoes the body (row 1). |
+| `POST /nonconforming/{orders,release,throws,short-retention,passthrough}` | The same handlers **without idemfence**, so the suite can be shown failing. Never do this in a real application. |
+
+`conformance.json` points the suite at the idempotent routes and `conformance.nonconforming.json`
+at the non-conforming group:
+
+```sh
+node ../packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config conformance.json --require-all
+node ../packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config conformance.nonconforming.json   # exits 1
+```
+
 ### The principal
 
-`POST /orders` takes the principal from an `X-Principal` header (1 to 64 printable ASCII
-characters, no spaces; otherwise `400`). That exists so the conformance suite can act as
-several callers. **A real application must derive the principal from its authentication**
-(a session, token or API key), never from a header the client controls: with a
-client-chosen principal, any caller could replay or block another caller's keys.
+The idempotent routes take the principal from an `X-Principal` header (1 to 64 printable
+ASCII characters, no spaces; a malformed value is a `400`). That exists so the conformance
+suite can act as several callers. **A real application must derive the principal from its
+authentication** (a session, token or API key), never from a header the client controls:
+with a client-chosen principal, any caller could replay or block another caller's keys. A
+real application also rejects unauthenticated requests before idemfence runs (`401`); this
+app deliberately lets a *missing* header reach idemfence, which answers with the contract's
+row 4 (`500 configuration-error`), so the suite can verify that row.
 
 ## Configuration
 

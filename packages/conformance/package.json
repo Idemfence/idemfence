@@ -2,7 +2,7 @@
   "name": "idemfence-conformance",
   "version": "0.0.0",
   "private": true,
-  "description": "Conformance suite for HTTP idempotency-key middleware",
+  "description": "Black-box conformance suite for the idemfence HTTP idempotency contract",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -18,5 +18,11 @@
   },
   "files": [
     "dist"
-  ]
+  ],
+  "bin": {
+    "idemfence-conformance": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
 }
