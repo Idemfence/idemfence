@@ -27,11 +27,12 @@ Node 22.13 or later. The Postgres store (`idemfence/postgres`) uses your own
   handler)`, with configuration validated at construction (`IdemfenceConfigError`).
 - `idemfence/fetch`: `idempotent(idem, route, handler)` wraps a Web-standard
   `(request: Request) => Promise<Response>` handler; it depends on no framework and is tested
-  on Hono over HTTP/1.1 and HTTP/2.
+  on Hono over HTTP/1.1 and HTTP/2. The key is enforced on the route's `methods` (default
+  `["POST", "PATCH"]`); other methods reach the handler without idemfence through
+  `idem.passthrough()`, which on a transactional route still opens a plain transaction for
+  `ctx.tx` (see below).
 - `idemfence/postgres`: `postgresStore({ pool, schema?, lockTimeout? })` on PostgreSQL. The
-  schema ships as `idemfence/postgres/migrations/001_init.sql`. It also exports
-  `withTransaction(pool, { lockTimeout? }, fn)`, which runs `fn` on one pooled client inside
-  `BEGIN` / `SET LOCAL lock_timeout` / `COMMIT`, rolling back when `fn` throws.
+  schema ships as `idemfence/postgres/migrations/001_init.sql`.
 - `idemfence-conformance` (in this repository): a black-box suite that checks a running
   service against the contract, row by row, plus a concurrency group.
 
@@ -108,9 +109,12 @@ Rules for `ctx.tx`:
   reaches the pooled connection, which may already serve another request. Finish every
   query before returning: a response body that streams after `COMMIT` (one over
   `responseBodyCap`, or any body on a request without a key) must not read from `ctx.tx`.
-- On an optional-key route (`required: false`), a request without a key runs the handler in
-  a plain transaction with no record: committed when the handler returns, rolled back when
-  it throws.
+- A request idemfence does not apply to runs the handler in a plain transaction with no
+  record: committed when the handler returns, rolled back (and the error rethrown) when it
+  throws. That covers a request without a key on an optional-key route
+  (`required: false`), and, with `idemfence/fetch`, a method outside the route's `methods`
+  (for example a GET on the default POST and PATCH). `ctx.tx` is there either way, and
+  `ctx.deriveKey` rejects with `DERIVE_KEY_UNAVAILABLE`.
 
 A concurrent request with the same key waits on the first one's uncommitted record for up
 to the store's `lockTimeout` (default 250 ms; an invalid value throws
