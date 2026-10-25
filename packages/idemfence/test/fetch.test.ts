@@ -632,6 +632,7 @@ describe("the built package", () => {
         "IdemfenceConfigError",
         "IdemfenceDeriveError",
         "IdemfenceFencedError",
+        "IdemfenceHoldLimitError",
         "IdemfenceStoreError",
         "createIdemfence",
       ],

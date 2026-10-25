@@ -320,6 +320,28 @@ compare-and-set on the fencing token (row 9). All lease times MUST come from the
 clock (Postgres `clock_timestamp()`, Redis `TIME`). Application server clocks MUST NOT be
 used for lease decisions.
 
+- **Heartbeat.** By default the lease is renewed every lease / 3 while the handler runs, each
+  renewal starting only after the previous one has finished. The heartbeat stops when the
+  handler settles, and any renewal in flight finishes before the response is stored or the
+  record released. A route MAY turn the heartbeat off and renew explicitly instead.
+- **Fenced renewal.** When a renewal (heartbeat or explicit) is rejected as fenced (row 9),
+  the heartbeat stops and the handler's abort signal MUST be aborted with a fenced reason.
+  The handler is not otherwise interrupted; its later complete is fenced, so its response
+  goes to its own client unstored. A renewal that fails for another reason (a store error)
+  does not abort the signal and is retried at the next interval.
+- **Hold limit.** A process MUST stop renewing a lease it has held for `maxHold`, measured from
+  acquisition on its own monotonic clock, and abort the handler's abort signal with a
+  hold-limit reason; explicit renewals are refused from then on. `maxHold` is greater than
+  the lease, no greater than retention, and at most 2147483647 milliseconds (about 24.8
+  days, the longest delay a timer can wait); its default is the smallest of 10 leases,
+  retention and that cap. This bounds only how long the process keeps
+  renewing; the lease then expires on the store's clock, which still makes every lease
+  decision. A key is therefore held in flight for at most `maxHold` plus one lease before
+  row 9 lets another attempt take over, so no key stays stuck behind a live but hung
+  handler.
+- **Abort signal.** The handler's abort signal is not tied to the client connection: a
+  client disconnect MUST NOT abort it (row 16).
+
 **Transactional mode** (Postgres). The record is written inside the handler's own database
 transaction, so the record and the handler's writes commit or roll back together (rows 11
 and 13). A concurrent request with the same key waits on the uncommitted record up to the
@@ -327,7 +349,9 @@ configured lock timeout, then receives 409 [in-flight](#in-flight) with `Retry-A
 that timeout in whole seconds, rounded up (minimum 1). The lock timeout applies only to the
 statements that claim the record: once the record is claimed, the previous `lock_timeout` is
 restored, so the handler's own statements run with the connection's normal setting. Row 9
-does not apply: a crashed handler's transaction rolls back and frees the key.
+does not apply: a crashed handler's transaction rolls back and frees the key. There is no
+lease, so there is no heartbeat and no hold limit, and the handler's abort signal never
+aborts.
 
 ## 8. Logging
 

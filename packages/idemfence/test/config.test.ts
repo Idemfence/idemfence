@@ -82,6 +82,7 @@ describe("resolveConfig defaults", () => {
       docsUrl: "https://example.com/docs/idempotency",
       retention: 86_400_000,
       lease: 30_000,
+      maxHold: 300_000,
       keyMaxLength: 255,
       keySyntax: "sf-string",
       requestBodyCap: 1_048_576,

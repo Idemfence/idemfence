@@ -15,9 +15,11 @@ import {
   type DeriveKey,
   type Handler,
   type HandlerContext,
+  type HandlerSignal,
   IdemfenceDeriveError,
   type IdemfenceDeriveErrorCode,
   IdemfenceFencedError,
+  IdemfenceHoldLimitError,
   type LeaseHandlerContext,
   type TransactionalHandlerContext,
 } from "./engine.js";
@@ -38,6 +40,7 @@ export type {
   Duration,
   Handler,
   HandlerContext,
+  HandlerSignal,
   IdemfenceConfigErrorCode,
   IdemfenceDeriveErrorCode,
   IdemfenceOptions,
@@ -49,7 +52,12 @@ export type {
   RouteMode,
   TransactionalHandlerContext,
 };
-export { IdemfenceConfigError, IdemfenceDeriveError, IdemfenceFencedError };
+export {
+  IdemfenceConfigError,
+  IdemfenceDeriveError,
+  IdemfenceFencedError,
+  IdemfenceHoldLimitError,
+};
 
 /** An idemfence instance: validated configuration bound to a store. */
 export interface Idemfence {

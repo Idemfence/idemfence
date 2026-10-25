@@ -6,6 +6,7 @@ export type {
   DeriveKey,
   Handler,
   HandlerContext,
+  HandlerSignal,
   LeaseHandlerContext,
   TransactionalHandlerContext,
 } from "./engine.js";
