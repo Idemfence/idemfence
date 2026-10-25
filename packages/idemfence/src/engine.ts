@@ -5,7 +5,7 @@ import {
   type RouteConfig,
   resolveRoute,
 } from "./config.js";
-import { fingerprint, lookupKey } from "./hash.js";
+import { derivedKey, deriveHmacKey, fingerprint, lookupKey } from "./hash.js";
 import { parseIdempotencyKey } from "./key.js";
 import {
   internalProblemResponse,
@@ -32,10 +32,51 @@ export class IdemfenceFencedError extends Error {
   }
 }
 
+/**
+ * Stable codes for {@link IdemfenceDeriveError}:
+ *
+ * - `DERIVE_LABEL_INVALID`: the label passed to `ctx.deriveKey` is not a string of 1 to 128
+ *   printable ASCII characters (0x21 to 0x7E, so no spaces).
+ * - `DERIVE_KEY_UNAVAILABLE`: `ctx.deriveKey` was called on a request without an
+ *   `Idempotency-Key` (an optional-key route, or a method the adapter does not enforce),
+ *   so there is no lookup key to derive from.
+ */
+export type IdemfenceDeriveErrorCode =
+  | "DERIVE_LABEL_INVALID"
+  | "DERIVE_KEY_UNAVAILABLE";
+
+/** Rejection of `ctx.deriveKey` (docs/contract.md section 5, derived downstream keys). */
+export class IdemfenceDeriveError extends Error {
+  readonly code: IdemfenceDeriveErrorCode;
+
+  constructor(code: IdemfenceDeriveErrorCode, message: string) {
+    super(message);
+    this.name = "IdemfenceDeriveError";
+    this.code = code;
+  }
+}
+
+/**
+ * Derives a downstream idempotency key for a call this request makes to another service,
+ * such as a payment provider (docs/contract.md section 5). The key depends only on the
+ * request's lookup key, its fingerprint, the label and the oldest configured secret, so
+ * every attempt of the same request (a retry after a throw or a release, a lease takeover,
+ * a fail-open run) derives the same value, and a reused key with a different payload
+ * derives a different one. Resolves to 64 lowercase hex characters.
+ *
+ * `label` names the downstream call and must be 1 to 128 printable ASCII characters
+ * (0x21 to 0x7E); anything else rejects with {@link IdemfenceDeriveError} code
+ * `DERIVE_LABEL_INVALID`. On a request without an `Idempotency-Key` it rejects with code
+ * `DERIVE_KEY_UNAVAILABLE`.
+ */
+export type DeriveKey = (label: string) => Promise<string>;
+
 /** The handler's context in lease mode (the default). */
 export interface LeaseHandlerContext {
   /** Extends the lease; rejects with {@link IdemfenceFencedError} once fenced. */
   renew(): Promise<void>;
+  /** See {@link DeriveKey}. */
+  readonly deriveKey: DeriveKey;
   /** Absent in lease mode. */
   readonly tx?: undefined;
 }
@@ -69,6 +110,8 @@ export interface TransactionalHandlerContext {
    *   key) must not read from `ctx.tx`.
    */
   readonly tx: SqlExecutor;
+  /** See {@link DeriveKey}. */
+  readonly deriveKey: DeriveKey;
 }
 
 export type HandlerContext = LeaseHandlerContext | TransactionalHandlerContext;
@@ -126,8 +169,36 @@ type HandlerOutcome =
   | { kind: "response"; response: Response }
   | { kind: "threw"; error: unknown };
 
-const passthroughContext: LeaseHandlerContext = {
+const DERIVE_LABEL = /^[\x21-\x7e]{1,128}$/;
+
+function checkLabel(label: unknown): void {
+  if (typeof label !== "string" || !DERIVE_LABEL.test(label)) {
+    throw new IdemfenceDeriveError(
+      "DERIVE_LABEL_INVALID",
+      "ctx.deriveKey: `label` must be 1 to 128 printable ASCII characters (0x21 to 0x7E).",
+    );
+  }
+}
+
+/**
+ * `deriveKey` on a request without an `Idempotency-Key`. A bad label is still reported as
+ * such, so the bug shows on every request.
+ */
+const deriveUnavailable: DeriveKey = async (label) => {
+  checkLabel(label);
+  throw new IdemfenceDeriveError(
+    "DERIVE_KEY_UNAVAILABLE",
+    "ctx.deriveKey: this request has no Idempotency-Key, so there is no key to derive from.",
+  );
+};
+
+/**
+ * The lease-mode context for a request idemfence does not apply to (no key on an
+ * optional-key route, or a method the adapter does not enforce).
+ */
+export const passthroughContext: LeaseHandlerContext = {
   async renew() {},
+  deriveKey: deriveUnavailable,
 };
 
 // The row each non-acquired begin outcome answers, for logs.
@@ -145,6 +216,28 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       routes.set(route, result);
     }
     return result;
+  }
+
+  // The HMAC key for derived keys is imported once, from the oldest secret (the last entry
+  // of previousSecrets, which is newest first): rotating a new secret in moves the old one
+  // to the front of previousSecrets and changes no derived key.
+  // The fingerprint is the one already computed for the request (row 15), so a reused key
+  // with a different payload derives a different key.
+  let hmacKey: Promise<CryptoKey> | undefined;
+  function deriveFor(
+    lookup: Uint8Array,
+    requestFingerprint: Uint8Array,
+  ): DeriveKey {
+    return async (label) => {
+      checkLabel(label);
+      hmacKey ??= deriveHmacKey(
+        config.previousSecrets.at(-1) ?? config.secret,
+      ).catch((error: unknown) => {
+        hmacKey = undefined;
+        throw error;
+      });
+      return derivedKey(await hmacKey, lookup, requestFingerprint, label);
+    };
   }
 
   // ready() runs once; a failure is not cached, so a later request can retry it.
@@ -261,7 +354,11 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
             error: errorInfo(error),
           },
         );
-        return handler(request, passthroughContext);
+        // The lookup key is known, so downstream calls still deduplicate.
+        return handler(request, {
+          async renew() {},
+          deriveKey: deriveFor(key, printed.fingerprint),
+        });
       }
       return storeUnavailable(
         route,
@@ -282,6 +379,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       keyHash,
       begun.fencingToken,
       begun.attempts,
+      deriveFor(key, printed.fingerprint),
     );
   }
 
@@ -397,7 +495,10 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
 
     let response: Response;
     try {
-      response = await handler(request, { tx: transaction.executor });
+      response = await handler(request, {
+        tx: transaction.executor,
+        deriveKey: deriveFor(key, requestFingerprint),
+      });
     } catch (error) {
       return threw(error);
     }
@@ -474,7 +575,10 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     const transaction = await (store as TransactionalStore).openTransaction();
     let response: Response;
     try {
-      response = await handler(request, { tx: transaction.executor });
+      response = await handler(request, {
+        tx: transaction.executor,
+        deriveKey: deriveUnavailable,
+      });
     } catch (error) {
       await rollback(transaction, undefined, 1);
       throw error;
@@ -520,6 +624,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     keyHash: string,
     fencingToken: bigint,
     attempts: number,
+    deriveKey: DeriveKey,
   ): Promise<Response> {
     const row = attempts > 1 ? 9 : 5;
     const ctx: LeaseHandlerContext = {
@@ -528,6 +633,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
           throw new IdemfenceFencedError();
         }
       },
+      deriveKey,
     };
 
     let outcome: HandlerOutcome;
