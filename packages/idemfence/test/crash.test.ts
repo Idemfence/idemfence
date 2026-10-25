@@ -36,6 +36,8 @@ interface RoundStats {
   executions: number;
   orders: number;
   conflicts: number;
+  /** Transactional mode: from the kill returning to the first retry's answer. */
+  killToFirstMs?: number;
 }
 const stats = new Map<string, RoundStats[]>();
 
@@ -69,6 +71,15 @@ afterAll(async () => {
       executions: range((r) => r.executions),
       orders: range((r) => r.orders),
       conflicts: range((r) => r.conflicts),
+      ...(rounds.every((r) => r.killToFirstMs !== undefined)
+        ? {
+            killToFirstMs: range((r) => Math.round(r.killToFirstMs ?? 0)),
+            killToFirstMeanMs: Math.round(
+              rounds.reduce((sum, r) => sum + (r.killToFirstMs ?? 0), 0) /
+                rounds.length,
+            ),
+          }
+        : {}),
     };
   }
   // CRASH_SUMMARY names a file for the per-point counts (CI prints it).
@@ -172,12 +183,17 @@ async function recordRows(route: string, key: string): Promise<RecordRow[]> {
 /**
  * One round: a child killed at `point` while serving the request, a fresh child, and the
  * retries. Returns what was observed.
+ *
+ * Transactional mode starts the survivor before the kill and sends the retry the moment
+ * the kill returns, with no restart in between: the killed backend's transaction must be
+ * gone (or go within the lock timeout) by the time that retry claims the key.
  */
 async function round(mode: Mode, point: Point): Promise<RoundStats> {
   const route = `/crash-${randomBytes(4).toString("hex")}`;
   const key = `crash-${randomBytes(8).toString("hex")}`;
 
   const doomed = await start(mode, route, point);
+  const early = mode === "transactional" ? await start(mode, route) : undefined;
   const lost = send(doomed, route, key).then(
     () => "answered",
     () => "connection lost",
@@ -186,10 +202,18 @@ async function round(mode: Mode, point: Point): Promise<RoundStats> {
     (event) => event.event === "kill-point" && event.via === "ipc",
   );
   await kill(doomed);
+  const killedAt = performance.now();
+  const immediate =
+    early === undefined
+      ? undefined
+      : send(early, route, key).then((reply) => ({
+          reply,
+          ms: performance.now() - killedAt,
+        }));
   // No response byte left the killed child, whatever the point.
   expect(await lost).toBe("connection lost");
 
-  const survivor = await start(mode, route);
+  const survivor = early ?? (await start(mode, route));
   let conflicts = 0;
   try {
     if (mode === "lease" && point !== "P4") {
@@ -230,7 +254,15 @@ async function round(mode: Mode, point: Point): Promise<RoundStats> {
       return { ...seen, conflicts };
     }
 
-    const first = await send(survivor, route, key);
+    // Transactional mode: the retry already sent the moment the kill returned.
+    const timed = (await immediate) ?? {
+      reply: await send(survivor, route, key),
+      ms: undefined,
+    };
+    const first = timed.reply;
+    if (first.status === 409) {
+      conflicts += 1;
+    }
     if (point === "P4") {
       // The killed attempt's outcome was stored before it died: the retry replays it.
       expect(first.status).toBe(201);
@@ -255,7 +287,11 @@ async function round(mode: Mode, point: Point): Promise<RoundStats> {
     const seen = await counts(key);
     expect(seen.executions).toBe(1);
     expect(seen.orders).toBe(mode === "lease" ? 1 : 0);
-    return { ...seen, conflicts };
+    return {
+      ...seen,
+      conflicts,
+      ...(timed.ms === undefined ? {} : { killToFirstMs: timed.ms }),
+    };
   } finally {
     await kill(survivor);
   }
