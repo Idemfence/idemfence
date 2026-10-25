@@ -38,6 +38,58 @@ Node 22.13 or later. The Postgres store (`idemfence/postgres`) uses your own
 
 Redis and the Express and Fastify adapters are not released yet.
 
+## Lease mode: heartbeat, ctx.signal and maxHold
+
+In lease mode (the default) a request claims its key with a lease. While the handler runs,
+idemfence renews the lease every `lease / 3` (the heartbeat), so a handler may take longer
+than `lease` without anyone taking its key over. The lease matters when a process dies or
+hangs: another attempt can take the key over (contract row 9) once the lease expires on the
+database's clock.
+
+- **Sizing `lease`** (default `"30s"`): it is how long a key stays blocked after its holder
+  crashes, and the heartbeat must reach the database at least once per lease. Keep it well
+  above your database's worst-case round trip, and well below what a waiting client will
+  put up with. Every attempt answers a concurrent duplicate with a 409 whose `Retry-After`
+  is the remaining lease.
+- **`ctx.signal`** aborts when this attempt has lost its lease: a renewal found that another
+  attempt took the key over (`signal.reason` is an `IdemfenceFencedError`), or the hold limit
+  was reached (`IdemfenceHoldLimitError`). Pass it to downstream calls so they stop, and
+  combine it with `ctx.deriveKey` so a call that did go through is not repeated by the
+  attempt that took over:
+
+  ```ts
+  const pay = idempotent(idem, { routeTemplate: "/orders/:id/pay" }, async (request, ctx) => {
+    const response = await fetch("https://payments.example.com/v1/charges", {
+      method: "POST",
+      signal: ctx.signal,
+      headers: { "idempotency-key": await ctx.deriveKey("payment-charge") },
+      body: await request.text(),
+    });
+    return new Response(response.body, { status: response.ok ? 201 : 502 });
+  });
+  ```
+
+  Aborting the signal interrupts nothing by itself: a handler that ignores it runs to the
+  end, and its response goes to its own client without being stored. The signal is not the
+  request's signal: a client that disconnects does not abort it (contract row 16). It never
+  aborts in transactional mode, on a fail-open run, or on a request idemfence does not apply
+  to.
+- **`heartbeat: false`** on a route turns the timer off; the handler then keeps its lease
+  with `await ctx.renew()`, which rejects with `IdemfenceFencedError` (after aborting
+  `ctx.signal`) once another attempt has taken over.
+- **`maxHold`** (instance option, default `min(10 × lease, retention)`) bounds how long one
+  process keeps a lease alive. After `maxHold`, measured from acquisition on the process's
+  own monotonic clock, the heartbeat stops, `ctx.signal` aborts with
+  `IdemfenceHoldLimitError`, `ctx.renew()` rejects with it, and the lease expires one lease
+  later on the database's clock. A key is therefore never blocked for longer than
+  `maxHold + lease` by a handler that hangs while its process stays alive. It must be
+  greater than `lease` (`MAX_HOLD_NOT_LONGER_THAN_LEASE`) and no greater than `retention`
+  (`MAX_HOLD_LONGER_THAN_RETENTION`).
+
+Lease renewals that fail with a store error are logged (`renew-failed`) and retried at the
+next interval; fenced renewals and the hold limit are logged with outcomes `fenced` and
+`hold-limit`.
+
 ## Transactional mode
 
 A route with `mode: "transactional"` runs its handler inside one of the store's
