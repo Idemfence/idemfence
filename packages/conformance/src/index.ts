@@ -33,7 +33,7 @@ export interface TargetConfig {
     /** GET → `{ "count": n }`: the number of side effects so far. */
     count?: { path: string };
     /** An idempotent request whose handler takes about `workMs` milliseconds. */
-    slow?: Fixture & { workMs: number };
+    slow?: Fixture & { workMs: number; workField: string };
     /** An idempotent request answered with the configured release status. */
     release?: Fixture & { status: number };
     /** An idempotent request whose handler throws. */
@@ -170,6 +170,14 @@ export function validateConfig(value: unknown): TargetConfig {
       }
     }
     const slow = fixture("slow", (f) => {
+      if (
+        f.workField !== undefined &&
+        (typeof f.workField !== "string" || f.workField === "")
+      ) {
+        problems.push(
+          "fixtures.slow.workField must be a non-empty string when present",
+        );
+      }
       if (!Number.isInteger(f.workMs) || (f.workMs as number) < 500) {
         problems.push(
           "fixtures.slow.workMs must be an integer of at least 500 (milliseconds)",
@@ -177,7 +185,14 @@ export function validateConfig(value: unknown): TargetConfig {
       }
     });
     if (slow !== undefined) {
-      fixtures.slow = { ...base(slow), workMs: Number(slow.workMs) };
+      fixtures.slow = {
+        ...base(slow),
+        workMs: Number(slow.workMs),
+        workField:
+          typeof slow.workField === "string"
+            ? slow.workField
+            : "simulateWorkMs",
+      };
     }
     const release = fixture("release", (f) => {
       if (
@@ -260,6 +275,9 @@ export interface CliOptions {
   json: boolean;
   requireAll: boolean;
   only: number[] | undefined;
+  group: "contract" | "concurrency";
+  iterations: number;
+  concurrency: number;
 }
 
 export const USAGE = `Usage: idemfence-conformance --url <base-url> --config <target.json> [options]
@@ -272,6 +290,9 @@ Options:
   --json                Machine-readable output
   --require-all         Treat scenarios that were not run (missing fixtures) as failures
   --only <rows>         Comma-separated row numbers to run, for example 5,6,7
+  --group <name>        contract (default) or concurrency
+  --iterations <n>      Concurrency group: iterations (default 1000)
+  --concurrency <n>     Concurrency group: requests per iteration (default 50)
   --help                Show this help
 
 Exit status is 0 only when no scenario failed (and, with --require-all, none was not run).
@@ -289,6 +310,9 @@ export function parseCliArgs(
       json: { type: "boolean", default: false },
       "require-all": { type: "boolean", default: false },
       only: { type: "string" },
+      group: { type: "string", default: "contract" },
+      iterations: { type: "string", default: "1000" },
+      concurrency: { type: "string", default: "50" },
       help: { type: "boolean", default: false },
     },
     strict: true,
@@ -325,6 +349,18 @@ export function parseCliArgs(
       );
     }
   }
+  const group = values.group;
+  if (group !== "contract" && group !== "concurrency") {
+    problems.push("--group must be contract or concurrency");
+  }
+  const iterations = Number(values.iterations);
+  if (!Number.isInteger(iterations) || iterations < 1) {
+    problems.push("--iterations must be a positive integer");
+  }
+  const concurrency = Number(values.concurrency);
+  if (!Number.isInteger(concurrency) || concurrency < 2) {
+    problems.push("--concurrency must be an integer of at least 2");
+  }
   if (problems.length > 0) {
     throw new Error(problems.join("; "));
   }
@@ -334,6 +370,9 @@ export function parseCliArgs(
     json: values.json,
     requireAll: values["require-all"],
     only,
+    group: group as "contract" | "concurrency",
+    iterations,
+    concurrency,
   };
 }
 
@@ -346,6 +385,8 @@ interface Reply {
   headers: http.IncomingHttpHeaders;
   bytes: Buffer;
 }
+
+export type BurstReply = Reply | { error: string };
 
 interface SendOptions {
   key?: string | string[] | undefined;
@@ -361,6 +402,73 @@ class Client {
     private readonly base: URL,
     private readonly headers: Record<string, string>,
   ) {}
+
+  /**
+   * Sends `n` identical requests released together: every connection is opened and the
+   * request head sent first, then each body is released after a random 0 to 5 ms jitter.
+   * Connections are kept alive across bursts so a long run does not exhaust local ports.
+   */
+  async burst(
+    fixture: Fixture,
+    key: string,
+    body: Buffer,
+    n: number,
+    agent: http.Agent | https.Agent,
+  ): Promise<BurstReply[]> {
+    const url = new URL(fixture.path, this.base);
+    const headers: http.OutgoingHttpHeaders = {
+      ...this.headers,
+      "content-type": "application/json",
+      "content-length": String(body.byteLength),
+      "idempotency-key": `"${key}"`,
+    };
+    const transport = url.protocol === "https:" ? https : http;
+    const requests = Array.from({ length: n }, () =>
+      transport.request(url, { method: fixture.method, headers, agent }),
+    );
+    const replies = requests.map(
+      (request) =>
+        new Promise<BurstReply>((resolve) => {
+          const chunks: Buffer[] = [];
+          request.setTimeout(30_000, () =>
+            request.destroy(new Error("request timed out after 30 s")),
+          );
+          request.on("response", (response) => {
+            response.on("data", (chunk: Buffer) => chunks.push(chunk));
+            response.on("end", () =>
+              resolve({
+                status: response.statusCode ?? 0,
+                headers: response.headers,
+                bytes: Buffer.concat(chunks),
+              }),
+            );
+            response.on("error", (error) => resolve({ error: error.message }));
+          });
+          request.on("error", (error) => resolve({ error: error.message }));
+        }),
+    );
+    // Heads first: wait until every request has a connected socket.
+    await Promise.all(
+      requests.map(
+        (request) =>
+          new Promise<void>((resolve) => {
+            request.on("socket", (socket) => {
+              if (socket.connecting) {
+                socket.once("connect", () => resolve());
+              } else {
+                resolve();
+              }
+            });
+            request.flushHeaders();
+          }),
+      ),
+    );
+    // Then the bodies, together, with jitter.
+    for (const request of requests) {
+      setTimeout(() => request.end(body), Math.random() * 5);
+    }
+    return Promise.all(replies);
+  }
 
   async send(fixture: Fixture, options: SendOptions = {}): Promise<Reply> {
     const url = new URL(fixture.path, this.base);
@@ -1056,6 +1164,243 @@ export function formatHuman(
   }
   lines.push(
     `summary: ${summary.pass} passed, ${summary.fail} failed, ${summary.notRun} not run, ${summary.notTestable} not testable, ${summary.skipped} skipped: ${summary.ok ? "OK" : "NOT OK"}`,
+  );
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------------------
+// Concurrency group
+// ---------------------------------------------------------------------------------------
+
+export interface ConcurrencyOptions {
+  iterations: number;
+  concurrency: number;
+}
+
+export interface IterationFailure {
+  iteration: number;
+  keyPrefix: string;
+  histogram: Record<string, number>;
+  countDelta: number;
+  messages: string[];
+}
+
+export interface ConcurrencyResult {
+  group: "concurrency";
+  iterations: number;
+  concurrency: number;
+  totalRequests: number;
+  histogram: Record<string, number>;
+  failures: IterationFailure[];
+  durationMs: number;
+  ok: boolean;
+}
+
+export interface Classification {
+  histogram: Record<string, number>;
+  messages: string[];
+  ok: boolean;
+}
+
+const isReply = (reply: BurstReply): reply is Reply => !("error" in reply);
+
+/**
+ * Checks one burst: the count moved by exactly 1; exactly one non-replayed 2xx; every other
+ * reply is a 409 in-flight problem with an integer Retry-After or a byte-identical replay;
+ * no 5xx; no connection errors.
+ */
+export function classifyIteration(
+  replies: readonly BurstReply[],
+  countDelta: number,
+): Classification {
+  const histogram: Record<string, number> = {};
+  const bump = (bucket: string) => {
+    histogram[bucket] = (histogram[bucket] ?? 0) + 1;
+  };
+  const messages: string[] = [];
+  const errors: string[] = [];
+  const winners: Reply[] = [];
+  for (const reply of replies) {
+    if (!isReply(reply)) {
+      bump("error");
+      errors.push(reply.error);
+      continue;
+    }
+    const isReplay = replayed(reply);
+    bump(isReplay ? `${reply.status} replayed` : String(reply.status));
+    if (reply.status >= 200 && reply.status < 300 && !isReplay) {
+      winners.push(reply);
+    }
+  }
+  if (countDelta !== 1) {
+    messages.push(`count changed by ${countDelta}, expected exactly 1`);
+  }
+  if (errors.length > 0) {
+    messages.push(`${errors.length} connection error(s), first: ${errors[0]}`);
+  }
+  if (winners.length !== 1) {
+    messages.push(
+      `expected exactly one non-replayed 2xx, got ${winners.length}`,
+    );
+  }
+  const winner = winners[0];
+  let badReplies = 0;
+  let firstBad: string | undefined;
+  for (const reply of replies) {
+    if (!isReply(reply) || reply === winner) {
+      continue;
+    }
+    let problemMessage: string | undefined;
+    if (reply.status === 409) {
+      const sub = new Check();
+      problem(sub, reply, 409, "in-flight");
+      const retryAfter = String(reply.headers["retry-after"] ?? "");
+      sub.that(
+        /^[1-9]\d*$/.test(retryAfter),
+        `Retry-After should be a positive integer, got ${retryAfter || "none"}`,
+      );
+      problemMessage = sub.messages[0];
+    } else if (reply.status >= 200 && reply.status < 300 && replayed(reply)) {
+      if (winner !== undefined && reply.status !== winner.status) {
+        problemMessage = `replay status ${reply.status} differs from the winner's ${winner.status}`;
+      } else if (winner !== undefined && !reply.bytes.equals(winner.bytes)) {
+        problemMessage = "replay body is not byte-identical to the winner's";
+      }
+    } else if (reply.status >= 500) {
+      problemMessage = `server error ${reply.status}`;
+    } else {
+      problemMessage = `unexpected response ${reply.status}${replayed(reply) ? " (replayed)" : ""}`;
+    }
+    if (problemMessage !== undefined) {
+      badReplies += 1;
+      firstBad ??= problemMessage;
+    }
+  }
+  if (badReplies > 0) {
+    messages.push(
+      `${badReplies} reply(ies) neither a valid 409 nor a byte-identical replay, first: ${firstBad}`,
+    );
+  }
+  return { histogram, messages, ok: messages.length === 0 };
+}
+
+/** Runs the Concurrency group: `iterations` bursts of `concurrency` identical requests. */
+export async function runConcurrencyGroup(
+  baseUrl: string,
+  config: TargetConfig,
+  options: ConcurrencyOptions,
+): Promise<ConcurrencyResult> {
+  if (config.acknowledgeSideEffects !== true) {
+    throw new ConfigError([SIDE_EFFECTS_MESSAGE]);
+  }
+  const slow = config.fixtures.slow;
+  const count = config.fixtures.count;
+  if (slow === undefined || count === undefined) {
+    throw new ConfigError([
+      "the concurrency group needs the slow and count fixtures",
+    ]);
+  }
+  const base = new URL(baseUrl);
+  const client = new Client(base, config.headers);
+  const transport = base.protocol === "https:" ? https : http;
+  const agent = new transport.Agent({
+    keepAlive: true,
+    maxSockets: options.concurrency,
+    maxFreeSockets: options.concurrency,
+  });
+  const readCount = async (): Promise<number> => {
+    const reply = await client.send({ method: "GET", path: count.path });
+    const body = JSON.parse(reply.bytes.toString("utf8")) as {
+      count?: unknown;
+    };
+    if (reply.status !== 200 || typeof body.count !== "number") {
+      throw new Error(`count fixture ${count.path} returned ${reply.status}`);
+    }
+    return body.count;
+  };
+
+  const startedAt = Date.now();
+  const histogram: Record<string, number> = {};
+  const failures: IterationFailure[] = [];
+  try {
+    for (let iteration = 1; iteration <= options.iterations; iteration += 1) {
+      const key = newKey();
+      const workMs = Math.floor(Math.random() * 21);
+      const body = Buffer.from(
+        JSON.stringify({
+          ...(isRecord(slow.body) ? slow.body : {}),
+          [slow.workField]: workMs,
+        }),
+      );
+      const before = await readCount();
+      const replies = await client.burst(
+        slow,
+        key,
+        body,
+        options.concurrency,
+        agent,
+      );
+      const after = await readCount();
+      const result = classifyIteration(replies, after - before);
+      for (const [bucket, n] of Object.entries(result.histogram)) {
+        histogram[bucket] = (histogram[bucket] ?? 0) + n;
+      }
+      if (!result.ok) {
+        failures.push({
+          iteration,
+          keyPrefix: key.slice(0, KEY_PREFIX.length + 8),
+          histogram: result.histogram,
+          countDelta: after - before,
+          messages: result.messages,
+        });
+      }
+    }
+  } finally {
+    agent.destroy();
+  }
+  return {
+    group: "concurrency",
+    iterations: options.iterations,
+    concurrency: options.concurrency,
+    totalRequests: options.iterations * options.concurrency,
+    histogram,
+    failures,
+    durationMs: Date.now() - startedAt,
+    ok: failures.length === 0,
+  };
+}
+
+export function formatConcurrency(
+  baseUrl: string,
+  result: ConcurrencyResult,
+): string {
+  const histogram = Object.entries(result.histogram)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([bucket, n]) => `${bucket}: ${n}`)
+    .join(", ");
+  const lines = [
+    `idemfence conformance, Concurrency group, target ${baseUrl}`,
+    `  ${result.iterations} iterations x ${result.concurrency} requests = ${result.totalRequests} requests in ${(result.durationMs / 1000).toFixed(1)} s`,
+    `  histogram: ${histogram || "(none)"}`,
+  ];
+  for (const failure of result.failures.slice(0, 20)) {
+    const h = Object.entries(failure.histogram)
+      .map(([bucket, n]) => `${bucket}: ${n}`)
+      .join(", ");
+    lines.push(
+      `  iteration ${failure.iteration} FAIL (key ${failure.keyPrefix}..., count delta ${failure.countDelta}, histogram ${h})`,
+    );
+    for (const message of failure.messages) {
+      lines.push(`      ${message}`);
+    }
+  }
+  if (result.failures.length > 20) {
+    lines.push(
+      `  ... and ${result.failures.length - 20} more failing iterations`,
+    );
+  }
+  lines.push(
+    `summary: ${result.iterations - result.failures.length} iterations passed, ${result.failures.length} failed: ${result.ok ? "OK" : "NOT OK"}`,
   );
   return lines.join("\n");
 }
