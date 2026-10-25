@@ -537,7 +537,76 @@ describe("heartbeat: false", () => {
   });
 });
 
+describe("ctx.renew() and the end of the handler", () => {
+  it("a renew() the handler starts without awaiting is awaited before complete: no fenced entry, the response is stored", async () => {
+    // The real store, with each renewal reaching it 100 ms late, as on a slow link: without
+    // settle() waiting for it, it would land after complete and be fenced.
+    const inner = postgresStore({ pool, schema });
+    const { store, renewAt } = countingStore(inner);
+    const slow: TransactionalStore = {
+      ...store,
+      renew: async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return store.renew(...args);
+      },
+    };
+    const mark = logs.length;
+    let pending: Promise<void> | undefined;
+    let signal: AbortSignal | undefined;
+    const path = mount(
+      idemfence({ store: slow, lease: "300ms" }),
+      async (_request, ctx) => {
+        signal = ctx.signal;
+        pending = ctx.renew?.();
+        return Response.json({ ok: true }, { status: 201 });
+      },
+      { heartbeat: false },
+    );
+    const key = freshKey();
+    expect((await post(path, key)).status).toBe(201);
+    await expect(pending).resolves.toBeUndefined();
+    expect(renewAt).toHaveLength(1);
+    expect(signal?.aborted).toBe(false);
+    expect(fencedLogs(mark)).toEqual([]);
+    expect((await recordRows(path, key))[0]).toMatchObject({
+      state: "completed",
+      body: '{"ok":true}',
+    });
+  });
+
+  it("renew() after the response makes no store call and resolves", async () => {
+    const { store, renewAt } = countingStore(postgresStore({ pool, schema }));
+    let kept: (() => Promise<void>) | undefined;
+    const path = mount(
+      idemfence({ store, lease: "300ms" }),
+      async (_request, ctx) => {
+        kept = ctx.renew;
+        return Response.json({ ok: true }, { status: 201 });
+      },
+      { heartbeat: false },
+    );
+    expect((await post(path, freshKey())).status).toBe(201);
+    await expect(kept?.()).resolves.toBeUndefined();
+    expect(renewAt).toHaveLength(0);
+  });
+});
+
 describe("maxHold", () => {
+  it("with the default capped at 2147483647 ms (lease 3d, retention 30d), the hold timer does not fire at once", async () => {
+    let abortedAfterWait: boolean | undefined;
+    const path = mount(
+      idemfence({ lease: "3d", retention: "30d" }),
+      async (_request, ctx) => {
+        // An overflowing delay runs after 1 ms; this is far longer.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        abortedAfterWait = ctx.signal.aborted;
+        return Response.json({ ok: true }, { status: 201 });
+      },
+    );
+    expect((await post(path, freshKey())).status).toBe(201);
+    expect(abortedAfterWait).toBe(false);
+  });
+
   it("aborts ctx.signal with the hold limit, stops renewing and refuses renew(); the lease then expires and a retry takes over", async () => {
     const started = deferred();
     const gate = deferred();
@@ -606,7 +675,7 @@ describe("configuration", () => {
     docsUrl: DOCS,
   };
 
-  it("maxHold defaults to min(10 × lease, retention)", () => {
+  it("maxHold defaults to min(10 × lease, retention, 2147483647 ms)", () => {
     expect(resolveConfig(required).maxHold).toBe(300_000);
     expect(resolveConfig({ ...required, lease: "1s" }).maxHold).toBe(10_000);
     expect(
@@ -633,6 +702,28 @@ describe("configuration", () => {
     // Equal to retention is allowed.
     expect(resolveConfig({ ...required, maxHold: "24h" }).maxHold).toBe(
       86_400_000,
+    );
+  });
+
+  it("caps maxHold at the longest timer delay: an explicit 25d is MAX_HOLD_TOO_LONG, the default is clamped", () => {
+    expect(() =>
+      resolveConfig({ ...required, retention: "30d", maxHold: "25d" }),
+    ).toThrow(expect.objectContaining({ code: "MAX_HOLD_TOO_LONG" }));
+    expect(
+      resolveConfig({ ...required, retention: "30d", maxHold: 2_147_483_647 })
+        .maxHold,
+    ).toBe(2_147_483_647);
+    expect(
+      resolveConfig({ ...required, lease: "3d", retention: "30d" }).maxHold,
+    ).toBe(2_147_483_647);
+    // A lease that is not shorter than the clamped default names the cap as the cause.
+    expect(() =>
+      resolveConfig({ ...required, lease: "25d", retention: "30d" }),
+    ).toThrow(
+      expect.objectContaining({
+        code: "MAX_HOLD_NOT_LONGER_THAN_LEASE",
+        message: expect.stringContaining("capped at 2147483647 ms"),
+      }),
     );
   });
 

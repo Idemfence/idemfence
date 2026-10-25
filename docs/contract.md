@@ -332,7 +332,9 @@ used for lease decisions.
 - **Hold limit.** A process MUST stop renewing a lease it has held for `maxHold`, measured from
   acquisition on its own monotonic clock, and abort the handler's abort signal with a
   hold-limit reason; explicit renewals are refused from then on. `maxHold` is greater than
-  the lease and no greater than retention. This bounds only how long the process keeps
+  the lease, no greater than retention, and at most 2147483647 milliseconds (about 24.8
+  days, the longest delay a timer can wait); its default is the smallest of 10 leases,
+  retention and that cap. This bounds only how long the process keeps
   renewing; the lease then expires on the store's clock, which still makes every lease
   decision. A key is therefore held in flight for at most `maxHold` plus one lease before
   row 9 lets another attempt take over, so no key stays stuck behind a live but hung

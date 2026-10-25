@@ -77,14 +77,16 @@ database's clock.
 - **`heartbeat: false`** on a route turns the timer off; the handler then keeps its lease
   with `await ctx.renew()`, which rejects with `IdemfenceFencedError` (after aborting
   `ctx.signal`) once another attempt has taken over.
-- **`maxHold`** (instance option, default `min(10 × lease, retention)`) bounds how long one
+- **`maxHold`** (instance option, default `min(10 × lease, retention, 2147483647 ms)`) bounds how long one
   process keeps a lease alive. After `maxHold`, measured from acquisition on the process's
   own monotonic clock, the heartbeat stops, `ctx.signal` aborts with
   `IdemfenceHoldLimitError`, `ctx.renew()` rejects with it, and the lease expires one lease
   later on the database's clock. A key is therefore never blocked for longer than
   `maxHold + lease` by a handler that hangs while its process stays alive. It must be
-  greater than `lease` (`MAX_HOLD_NOT_LONGER_THAN_LEASE`) and no greater than `retention`
-  (`MAX_HOLD_LONGER_THAN_RETENTION`).
+  greater than `lease` (`MAX_HOLD_NOT_LONGER_THAN_LEASE`), no greater than `retention`
+  (`MAX_HOLD_LONGER_THAN_RETENTION`), and at most 2147483647 ms, about 24.8 days, the
+  longest delay a timer can wait (`MAX_HOLD_TOO_LONG`). With `maxHold` left at its
+  default, `lease` must therefore stay below that cap.
 
 Lease renewals that fail with a store error are logged (`renew-failed`) and retried at the
 next interval; fenced renewals and the hold limit are logged with outcomes `fenced` and

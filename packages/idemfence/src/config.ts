@@ -12,8 +12,12 @@ import type { Store, TransactionalStore } from "./store.js";
  * - `DURATION_INVALID`: `retention`, `lease`, `maxHold` or `storeUnavailableRetryAfter` is not
  *   a positive integer number of milliseconds or a string matching `/^\d+(ms|s|m|h|d)$/`.
  * - `LEASE_NOT_SHORTER_THAN_RETENTION`: `lease` is greater than or equal to `retention`.
- * - `MAX_HOLD_NOT_LONGER_THAN_LEASE`: `maxHold` is less than or equal to `lease`.
+ * - `MAX_HOLD_NOT_LONGER_THAN_LEASE`: `maxHold` is less than or equal to `lease`, including
+ *   when `maxHold` is left at its default and `lease` is not shorter than that default's
+ *   2147483647 ms cap.
  * - `MAX_HOLD_LONGER_THAN_RETENTION`: `maxHold` is greater than `retention`.
+ * - `MAX_HOLD_TOO_LONG`: `maxHold` is greater than 2147483647 ms (about 24.8 days), the
+ *   longest delay a timer can wait.
  * - `KEY_MAX_LENGTH_INVALID`: `keyMaxLength` is not an integer from 1 to 255.
  * - `KEY_SYNTAX_INVALID`: `keySyntax` is not `"sf-string"` or `"sf-string-or-raw"`.
  * - `BODY_CAP_INVALID`: `requestBodyCap` or `responseBodyCap` is not a positive integer.
@@ -51,6 +55,7 @@ export type IdemfenceConfigErrorCode =
   | "LEASE_NOT_SHORTER_THAN_RETENTION"
   | "MAX_HOLD_NOT_LONGER_THAN_LEASE"
   | "MAX_HOLD_LONGER_THAN_RETENTION"
+  | "MAX_HOLD_TOO_LONG"
   | "KEY_MAX_LENGTH_INVALID"
   | "KEY_SYNTAX_INVALID"
   | "BODY_CAP_INVALID"
@@ -136,9 +141,10 @@ export interface IdemfenceOptions<TRequest = unknown> {
    * its own monotonic clock. When it is reached, the heartbeat stops, `ctx.signal` aborts
    * with `IdemfenceHoldLimitError`, `ctx.renew()` rejects with it too, and the lease then
    * expires on the store's clock, so a key is held at most `maxHold + lease`. Default
-   * `min(10 × lease, retention)`. It must be greater than `lease`
-   * (`MAX_HOLD_NOT_LONGER_THAN_LEASE`) and no greater than `retention`
-   * (`MAX_HOLD_LONGER_THAN_RETENTION`).
+   * `min(10 × lease, retention, 2147483647 ms)`. It must be greater than `lease`
+   * (`MAX_HOLD_NOT_LONGER_THAN_LEASE`), no greater than `retention`
+   * (`MAX_HOLD_LONGER_THAN_RETENTION`), and at most 2147483647 ms, about 24.8 days, the
+   * longest delay a timer can wait (`MAX_HOLD_TOO_LONG`).
    */
   maxHold?: Duration;
   keyMaxLength?: number;
@@ -239,6 +245,9 @@ const MIN_SECRET_BYTES = 32;
 const DEFAULT_LOCK_TIMEOUT = "250ms";
 // Postgres lock_timeout is a 32-bit signed integer number of milliseconds.
 const MAX_LOCK_TIMEOUT_MS = 2_147_483_647;
+// setTimeout runs a longer delay after 1 ms instead (TimeoutOverflowWarning), so no timer
+// delay may exceed this: maxHold is one, and lease / 3 stays below it because lease < maxHold.
+const MAX_TIMER_MS = 2_147_483_647;
 const DURATION_PATTERN = /^(\d+)(ms|s|m|h|d)$/;
 const UNIT_MS = {
   ms: 1,
@@ -337,15 +346,23 @@ export function resolveConfig<TRequest>(
     );
   }
   // The default never exceeds retention, so configurations that leave maxHold unset keep
-  // working however short their retention is.
-  const maxHold =
-    options.maxHold === undefined
-      ? Math.min(10 * lease, retention)
-      : parseDuration("maxHold", options.maxHold);
+  // working however short their retention is, nor the longest timer delay.
+  const defaulted = options.maxHold === undefined;
+  const maxHold = defaulted
+    ? Math.min(10 * lease, retention, MAX_TIMER_MS)
+    : parseDuration("maxHold", options.maxHold);
+  if (maxHold > MAX_TIMER_MS) {
+    throw new IdemfenceConfigError(
+      "MAX_HOLD_TOO_LONG",
+      `Option \`maxHold\` must be at most ${MAX_TIMER_MS} ms (about 24.8 days), the longest delay a timer can wait.`,
+    );
+  }
   if (maxHold <= lease) {
     throw new IdemfenceConfigError(
       "MAX_HOLD_NOT_LONGER_THAN_LEASE",
-      "Option `maxHold` must be longer than option `lease`.",
+      defaulted && maxHold === MAX_TIMER_MS
+        ? `Option \`lease\` must be shorter than the default \`maxHold\`, which is capped at ${MAX_TIMER_MS} ms (about 24.8 days), the longest delay a timer can wait. Use a shorter lease.`
+        : "Option `maxHold` must be longer than option `lease`.",
     );
   }
   if (maxHold > retention) {

@@ -107,7 +107,10 @@ export interface LeaseHandlerContext {
   /**
    * Extends the lease. With the heartbeat on (the default) there is no need to call it.
    * Rejects with {@link IdemfenceFencedError} once fenced (and aborts `signal` first), and
-   * with {@link IdemfenceHoldLimitError} once the lease has been held for `maxHold`.
+   * with {@link IdemfenceHoldLimitError} once the lease has been held for `maxHold`. A
+   * renewal still running when the handler returns is awaited before the response is
+   * stored. Called after the handler has returned or thrown, it makes no store call and
+   * resolves.
    */
   renew(): Promise<void>;
   /** See {@link DeriveKey}. */
@@ -697,8 +700,11 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     const controller = new AbortController();
     let stopped = false;
     let holdLimitReached = false;
+    let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let inFlight: Promise<void> | undefined;
+    // ctx.renew() calls still running; settle() waits for them too, so none races complete.
+    const manual = new Set<Promise<unknown>>();
 
     const stopHeartbeat = () => {
       stopped = true;
@@ -770,19 +776,32 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     return {
       signal: controller.signal,
       async renew() {
+        // After the handler settled there is no lease to keep: the record is being completed
+        // or released, and a renewal now would only race that.
+        if (settled) {
+          return;
+        }
         if (holdLimitReached) {
           throw new IdemfenceHoldLimitError();
         }
-        if ((await store.renew(key, fencingToken, config.lease)) === "fenced") {
-          lost(new IdemfenceFencedError());
-          throw new IdemfenceFencedError();
+        const call = store.renew(key, fencingToken, config.lease);
+        const tracked = call.catch(() => undefined);
+        manual.add(tracked);
+        try {
+          if ((await call) === "fenced") {
+            lost(new IdemfenceFencedError());
+            throw new IdemfenceFencedError();
+          }
+        } finally {
+          manual.delete(tracked);
         }
       },
       async settle() {
+        settled = true;
         stopHeartbeat();
         clearTimeout(holdTimer);
-        while (inFlight !== undefined) {
-          await inFlight;
+        while (inFlight !== undefined || manual.size > 0) {
+          await Promise.all([inFlight, ...manual]);
         }
       },
     };
