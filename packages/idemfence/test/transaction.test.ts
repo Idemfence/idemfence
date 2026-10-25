@@ -7,7 +7,6 @@ import {
   type PostgresStore,
   postgresStore,
   type SqlExecutor,
-  withTransaction,
 } from "../src/stores/postgres/index.js";
 import { databaseUrl, migrate } from "./support/postgres.js";
 
@@ -51,6 +50,26 @@ async function visible(k: Uint8Array, orderId: string) {
   return { record: record.rowCount, order: order.rowCount };
 }
 
+/**
+ * Drives a store transaction the way the engine does: COMMIT when `fn` resolves; ROLLBACK
+ * and rethrow `fn`'s rejection when it rejects.
+ */
+async function within<T>(
+  on: PostgresStore,
+  fn: (tx: SqlExecutor) => Promise<T>,
+): Promise<T> {
+  const transaction = await on.openTransaction();
+  let result: T;
+  try {
+    result = await fn(transaction.executor);
+  } catch (error) {
+    await transaction.rollback().catch(() => undefined);
+    throw error;
+  }
+  await transaction.commit();
+  return result;
+}
+
 describe("SqlExecutor", () => {
   it("is satisfied by a pg Pool and by a pg PoolClient", async () => {
     const fromPool: SqlExecutor = pool;
@@ -71,61 +90,63 @@ describe("SqlExecutor", () => {
   });
 });
 
-describe("withTransaction", () => {
-  it("commits the handler's row and the store's record together", async () => {
+describe("openTransaction", () => {
+  it("commit() commits the handler's row and the store's record together", async () => {
     const k = key();
-    const result = await withTransaction(pool, {}, async (tx) => {
-      await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-commit"]);
-      const begun = await store.begin(k, fp, 5_000, 60_000, tx);
-      expect(begun.outcome).toBe("acquired");
-      // Uncommitted: invisible to another session.
-      expect(await visible(k, "o-commit")).toEqual({ record: 0, order: 0 });
-      return "done";
-    });
-    expect(result).toBe("done");
+    const transaction = await store.openTransaction();
+    const tx = transaction.executor;
+    await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-commit"]);
+    const begun = await store.begin(k, fp, 5_000, 60_000, tx);
+    expect(begun.outcome).toBe("acquired");
+    // Uncommitted: invisible to another session.
+    expect(await visible(k, "o-commit")).toEqual({ record: 0, order: 0 });
+    await transaction.commit();
     expect(await visible(k, "o-commit")).toEqual({ record: 1, order: 1 });
   });
 
-  it("rolls both back when the function throws, and propagates the error", async () => {
+  it("rollback() discards both, and a caller that rethrows propagates the error unchanged", async () => {
     const k = key();
+    const transaction = await store.openTransaction();
+    const tx = transaction.executor;
+    await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-rollback"]);
+    await store.begin(k, fp, 5_000, 60_000, tx);
+    await expect(transaction.rollback()).resolves.toBeUndefined();
+    expect(await visible(k, "o-rollback")).toEqual({ record: 0, order: 0 });
+
+    // The same through the engine's pattern: the rejection comes back as thrown.
     const boom = new Error("handler failed");
+    const k2 = key();
     await expect(
-      withTransaction(pool, {}, async (tx) => {
-        await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, [
-          "o-rollback",
+      within(store, async (tx2) => {
+        await tx2.query(`INSERT INTO ${orders} (id) VALUES ($1)`, [
+          "o-rollback-2",
         ]);
-        await store.begin(k, fp, 5_000, 60_000, tx);
+        await store.begin(k2, fp, 5_000, 60_000, tx2);
         throw boom;
       }),
     ).rejects.toBe(boom);
-    expect(await visible(k, "o-rollback")).toEqual({ record: 0, order: 0 });
+    expect(await visible(k2, "o-rollback-2")).toEqual({ record: 0, order: 0 });
   });
 
-  it("sets lock_timeout locally (default 250 ms) and leaves none on the released connection", async () => {
+  it("leaves no lock_timeout from begin on the released connection", async () => {
     const single = new pg.Pool({ connectionString: url, max: 1 });
     try {
-      const inside = await withTransaction(single, {}, async (tx) => {
-        const shown = await tx.query<{ lock_timeout: string }>(
-          "SHOW lock_timeout",
-        );
-        return shown.rows[0]?.lock_timeout;
+      const connectionDefault = (
+        await single.query<{ lock_timeout: string }>("SHOW lock_timeout")
+      ).rows[0]?.lock_timeout;
+      const singleStore = postgresStore({
+        pool: single,
+        schema,
+        lockTimeout: "2s",
       });
-      expect(inside).toBe("250ms");
-
-      const custom = await withTransaction(
-        single,
-        { lockTimeout: "2s" },
-        async (tx) =>
-          (await tx.query<{ lock_timeout: string }>("SHOW lock_timeout"))
-            .rows[0]?.lock_timeout,
-      );
-      expect(custom).toBe("2s");
-
-      // max: 1, so this is the same connection the transactions ran on.
+      await within(singleStore, async (tx) => {
+        await singleStore.begin(key(), fp, 5_000, 60_000, tx);
+      });
+      // max: 1, so this is the same connection the transaction ran on.
       const after = await single.query<{ lock_timeout: string }>(
         "SHOW lock_timeout",
       );
-      expect(after.rows[0]?.lock_timeout).toBe("0");
+      expect(after.rows[0]?.lock_timeout).toBe(connectionDefault);
     } finally {
       await single.end();
     }
@@ -133,15 +154,16 @@ describe("withTransaction", () => {
 
   it("returns every client to the pool after mixed commits and rollbacks", async () => {
     const own = new pg.Pool({ connectionString: url, max: 4 });
+    const ownStore = postgresStore({ pool: own, schema });
     try {
-      await withTransaction(own, {}, async (tx) => {
+      await within(ownStore, async (tx) => {
         await tx.query("SELECT 1");
       });
       const start = { total: own.totalCount, idle: own.idleCount };
       expect(start).toEqual({ total: 1, idle: 1 });
 
       for (let i = 0; i < 100; i += 1) {
-        const run = withTransaction(own, {}, async (tx) => {
+        const run = within(ownStore, async (tx) => {
           await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, [
             `o-mixed-${i}`,
           ]);
@@ -166,8 +188,9 @@ describe("withTransaction", () => {
     }
   });
 
-  it("destroys the client instead of returning it when ROLLBACK fails", async () => {
+  it("destroys the client instead of returning it when ROLLBACK fails, and rollback() rejects", async () => {
     const own = new pg.Pool({ connectionString: url, max: 1 });
+    const ownStore = postgresStore({ pool: own, schema });
     try {
       await own.query("SELECT 1");
       expect({ total: own.totalCount, idle: own.idleCount }).toEqual({
@@ -175,23 +198,20 @@ describe("withTransaction", () => {
         idle: 1,
       });
 
-      await expect(
-        withTransaction(own, {}, async (tx) => {
-          const pid = (
-            await tx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
-          ).rows[0]?.pid;
-          // The handler is attached before yielding: the kill can reject the query while
-          // the terminate round trip is still in flight.
-          const sleeping = tx.query("SELECT pg_sleep(5)").then(
-            () => "resolved",
-            (error: unknown) => error,
-          );
-          await observer.query("SELECT pg_terminate_backend($1)", [pid]);
-          const settled = await sleeping;
-          expect(settled).toMatchObject({ code: "57P01" });
-          throw new Error("backend gone");
-        }),
-      ).rejects.toThrow("backend gone");
+      const transaction = await ownStore.openTransaction();
+      const tx = transaction.executor;
+      const pid = (
+        await tx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+      ).rows[0]?.pid;
+      // The handler is attached before yielding: the kill can reject the query while the
+      // terminate round trip is still in flight.
+      const sleeping = tx.query("SELECT pg_sleep(5)").then(
+        () => "resolved",
+        (error: unknown) => error,
+      );
+      await observer.query("SELECT pg_terminate_backend($1)", [pid]);
+      expect(await sleeping).toMatchObject({ code: "57P01" });
+      await expect(transaction.rollback()).rejects.toBeDefined();
 
       // The broken connection was destroyed, not put back for the next caller.
       expect({ total: own.totalCount, idle: own.idleCount }).toEqual({
@@ -206,15 +226,14 @@ describe("withTransaction", () => {
     }
   });
 
-  it("rejects an invalid lockTimeout with LOCK_TIMEOUT_INVALID before taking a client", async () => {
-    for (const lockTimeout of [0, -1, 1.5, "soon", "", 2_147_483_648]) {
-      await expect(
-        withTransaction(
-          pool,
-          { lockTimeout } as { lockTimeout: "1s" },
-          async () => {},
-        ),
-      ).rejects.toEqual(
+  it("rejects an invalid store lockTimeout with LOCK_TIMEOUT_INVALID at construction", () => {
+    for (const lockTimeout of [0, -1, 1.5, "soon", "", 2_147_483_648, "0ms"]) {
+      expect(() =>
+        postgresStore({ pool, schema, lockTimeout } as {
+          pool: pg.Pool;
+          lockTimeout: "1s";
+        }),
+      ).toThrow(
         expect.objectContaining({
           name: "IdemfenceConfigError",
           code: "LOCK_TIMEOUT_INVALID",
@@ -227,7 +246,7 @@ describe("withTransaction", () => {
   });
 });
 
-describe("withTransaction when the backend dies", () => {
+describe("openTransaction when the backend dies", () => {
   it("leaves no unhandled error, no pool error and no broken client, wherever the kill lands", async () => {
     const uncaught: unknown[] = [];
     const onUncaught = (error: unknown) => {
@@ -235,6 +254,7 @@ describe("withTransaction when the backend dies", () => {
     };
     process.on("uncaughtException", onUncaught);
     const own = new pg.Pool({ connectionString: url, max: 1 });
+    const ownStore = postgresStore({ pool: own, schema });
     const poolErrors: unknown[] = [];
     own.on("error", (error) => {
       poolErrors.push(error);
@@ -247,25 +267,25 @@ describe("withTransaction when the backend dies", () => {
         .rows[0]?.pid;
 
     const scenarios: Record<string, () => Promise<unknown>> = {
-      // The kill is issued as soon as the client is handed out, racing BEGIN and SET LOCAL.
+      // The kill is issued as soon as the client is handed out, racing BEGIN.
       "before BEGIN completes": () => {
         let killed: Promise<void> | undefined;
         own.once("acquire", (client) => {
           killed = terminate((client as { processID?: number }).processID);
         });
-        return withTransaction(own, {}, async (tx) => {
+        return within(ownStore, async (tx) => {
           await killed;
           await tx.query("SELECT 1");
         });
       },
       "between statements": () =>
-        withTransaction(own, {}, async (tx) => {
+        within(ownStore, async (tx) => {
           await terminate(await pidOf(tx));
           await sleep(20);
           await tx.query("SELECT 1");
         }),
       "mid-statement": () =>
-        withTransaction(own, {}, async (tx) => {
+        within(ownStore, async (tx) => {
           const pid = await pidOf(tx);
           const sleeping = tx.query("SELECT pg_sleep(5)").then(
             () => "resolved",
@@ -276,7 +296,7 @@ describe("withTransaction when the backend dies", () => {
           throw new Error("backend gone");
         }),
       "during COMMIT": () =>
-        withTransaction(own, {}, async (tx) => {
+        within(ownStore, async (tx) => {
           await terminate(await pidOf(tx));
         }),
     };
@@ -315,7 +335,7 @@ describe("withTransaction when the backend dies", () => {
   });
 });
 
-describe("withTransaction error classification", () => {
+describe("openTransaction error classification", () => {
   it("TRANSACTION_UNAVAILABLE when the transaction cannot be opened", async () => {
     const dead = new pg.Pool({
       host: "127.0.0.1",
@@ -327,7 +347,9 @@ describe("withTransaction error classification", () => {
     });
     dead.on("error", () => {});
     try {
-      await expect(withTransaction(dead, {}, async () => {})).rejects.toEqual(
+      await expect(
+        postgresStore({ pool: dead, schema }).openTransaction(),
+      ).rejects.toEqual(
         expect.objectContaining({
           name: "IdemfenceStoreError",
           code: "TRANSACTION_UNAVAILABLE",
@@ -343,11 +365,11 @@ describe("withTransaction error classification", () => {
     await pool.query(
       `CREATE TABLE "${schema}".deferred (id int UNIQUE DEFERRABLE INITIALLY DEFERRED)`,
     );
-    await expect(
-      withTransaction(pool, {}, async (tx) => {
-        await tx.query(`INSERT INTO "${schema}".deferred (id) VALUES (1), (1)`);
-      }),
-    ).rejects.toEqual(
+    const transaction = await store.openTransaction();
+    await transaction.executor.query(
+      `INSERT INTO "${schema}".deferred (id) VALUES (1), (1)`,
+    );
+    await expect(transaction.commit()).rejects.toEqual(
       expect.objectContaining({
         name: "IdemfenceStoreError",
         code: "COMMIT_REJECTED",
@@ -364,15 +386,13 @@ describe("withTransaction error classification", () => {
   });
 
   it("COMMIT_REJECTED when the transaction was already aborted and COMMIT answers ROLLBACK", async () => {
-    // A failed statement that fn swallows leaves the transaction aborted; Postgres then
+    // A failed statement that is swallowed leaves the transaction aborted; Postgres then
     // answers COMMIT with a ROLLBACK tag and no error.
-    await expect(
-      withTransaction(pool, {}, async (tx) => {
-        await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-aborted"]);
-        await tx.query("SELECT 1 / 0").catch(() => undefined);
-        return "looks fine";
-      }),
-    ).rejects.toEqual(
+    const transaction = await store.openTransaction();
+    const tx = transaction.executor;
+    await tx.query(`INSERT INTO ${orders} (id) VALUES ($1)`, ["o-aborted"]);
+    await tx.query("SELECT 1 / 0").catch(() => undefined);
+    await expect(transaction.commit()).rejects.toEqual(
       expect.objectContaining({
         name: "IdemfenceStoreError",
         code: "COMMIT_REJECTED",
@@ -385,16 +405,18 @@ describe("withTransaction error classification", () => {
     const own = new pg.Pool({ connectionString: url, max: 1 });
     own.on("error", () => {});
     try {
-      await expect(
-        withTransaction(own, {}, async (tx) => {
-          const pid = (
-            await tx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
-          ).rows[0]?.pid;
-          await observer.query("SELECT pg_terminate_backend($1)", [pid]);
-          // Let the client process the FATAL before COMMIT is attempted.
-          await sleep(50);
-        }),
-      ).rejects.toEqual(
+      const transaction = await postgresStore({
+        pool: own,
+        schema,
+      }).openTransaction();
+      const pid = (
+        await transaction.executor.query<{ pid: number }>(
+          "SELECT pg_backend_pid() AS pid",
+        )
+      ).rows[0]?.pid;
+      // Returns once the backend is gone, so COMMIT reaches no server.
+      await observer.query("SELECT pg_terminate_backend($1, 5000)", [pid]);
+      await expect(transaction.commit()).rejects.toEqual(
         expect.objectContaining({
           name: "IdemfenceStoreError",
           code: "COMMIT_UNKNOWN",
@@ -443,7 +465,7 @@ describe("postgresStore.openTransaction", () => {
 
   it("accepts the executor on renew, complete, release and purgeExpired", async () => {
     const k = key();
-    const token = await withTransaction(pool, {}, async (tx) => {
+    const token = await within(store, async (tx) => {
       const begun = await store.begin(k, fp, 5_000, 60_000, tx);
       if (begun.outcome !== "acquired") {
         throw new Error(`unexpected ${begun.outcome}`);
@@ -468,7 +490,7 @@ describe("postgresStore.openTransaction", () => {
     });
     expect(await visible(k, "none")).toMatchObject({ record: 1 });
     // Completed records cannot be released; a stale token is fenced.
-    await withTransaction(pool, {}, async (tx) => {
+    await within(store, async (tx) => {
       expect(await store.release(k, token, tx)).toBe("fenced");
       expect(await store.purgeExpired(10, tx)).toBe(0);
     });

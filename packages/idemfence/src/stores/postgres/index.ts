@@ -21,7 +21,6 @@ export {
   type StoreTransaction,
   type TransactionalStore,
 } from "../../store.js";
-export { type TransactionOptions, withTransaction } from "./transaction.js";
 
 export interface PostgresStoreOptions {
   /** The caller's pool. The store never creates connections or reads environment variables. */
