@@ -69,19 +69,22 @@ jobs:
 
           failed=0
           for sha in $(git rev-list --reverse "${BASE_SHA}..${HEAD_SHA}"); do
-            # Flag a Co-authored-by trailer naming Claude or carrying an @anthropic.com email, and
-            # any "Generated with Claude Code" text. Matching is case-insensitive.
+            # Flag a Co-authored-by trailer whose email ends in @anthropic.com or whose name is
+            # "Claude" or a Claude product name ("Claude Opus 4.5"), and any "Generated with
+            # Claude Code" text. Matching is case-insensitive; a human named Claude passes.
             hits=$(git log -1 --format=%B "${sha}" | awk '
               {
                 low = tolower($0)
-                if (low ~ /generated with claude code/) { print; next }
+                if (low ~ /generated with \[?claude code/) { print; next }
                 if (low !~ /^[[:space:]]*co-authored-by:/) next
                 value = substr(low, index(low, ":") + 1)
                 name = value
                 sub(/<.*/, "", name)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
                 email = ""
                 if (match(value, /<[^>]*>/)) email = substr(value, RSTART + 1, RLENGTH - 2)
-                if (name ~ /claude/ || email ~ /@anthropic\.com$/) print
+                if (name == "claude" || name ~ /^claude (code|opus|sonnet|haiku|fable|mythos)/ ||
+                  email ~ /@anthropic\.com$/) print
               }')
             if [ -z "${hits}" ]; then
               echo "ok      ${sha}"
