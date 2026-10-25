@@ -6,3 +6,7 @@ coverage/
 .claude/settings.local.json
 *.tsbuildinfo
 .idea/
+# Copied into the package by scripts/prepack-copy.mjs at pack time.
+packages/idemfence/LICENSE
+packages/idemfence/NOTICE
+packages/idemfence/README.md

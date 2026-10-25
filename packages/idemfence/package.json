@@ -1,33 +1,58 @@
 {
   "name": "idemfence",
   "version": "0.0.0",
-  "private": true,
   "description": "HTTP idempotency-key middleware with fencing-token crash safety",
+  "keywords": [
+    "idempotency",
+    "idempotency-key",
+    "http",
+    "middleware",
+    "postgres",
+    "fencing-token",
+    "fetch",
+    "hono",
+    "retry",
+    "exactly-once"
+  ],
   "license": "Apache-2.0",
+  "homepage": "https://github.com/Idemfence/idemfence#readme",
+  "bugs": {
+    "url": "https://github.com/Idemfence/idemfence/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/idemfence/idemfence.git",
+    "url": "git+https://github.com/Idemfence/idemfence.git",
     "directory": "packages/idemfence"
   },
   "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./fetch": {
+      "types": "./dist/fetch.d.ts",
+      "default": "./dist/fetch.js"
+    },
     "./postgres": {
       "types": "./dist/stores/postgres/index.d.ts",
       "default": "./dist/stores/postgres/index.js"
     },
-    "./fetch": {
-      "types": "./dist/fetch.d.ts",
-      "default": "./dist/fetch.js"
-    }
+    "./postgres/migrations/001_init.sql": "./migrations/001_init.sql"
   },
   "files": [
     "dist",
-    "migrations"
+    "migrations",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
   ],
+  "scripts": {
+    "prepack": "node ../../scripts/prepack-copy.mjs"
+  },
   "peerDependencies": {
     "pg": "^8.23.1"
   },

@@ -1,0 +1,97 @@
+name: Release
+
+# Stages a new idemfence version on npm (trusted publishing, OIDC) and drafts the GitHub release.
+# Nothing is published or tagged by this workflow alone: the maintainer approves the staged
+# package on npm with 2FA and publishes the draft release, which creates the tag.
+#
+# Publish rule: a push to main publishes only when packages/idemfence's version is not on npm
+# yet AND has a matching heading in packages/idemfence/CHANGELOG.md, i.e. the version was
+# produced by `changeset version`. The manually bootstrapped 0.0.0 has no CHANGELOG entry, so
+# CI never publishes it.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+
+      # Staged publishing needs npm CLI >= 11.15.0 (trusted publishing >= 11.5.1).
+      - name: Install npm 11.21.0
+        run: npm install -g npm@11.21.0 && npm --version
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Artifact tests
+        run: node scripts/artifact-test.mjs
+
+      - name: Decide whether to publish
+        id: decide
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./packages/idemfence/package.json').version")
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if view=$(npm view "idemfence@${version}" version 2>&1); then
+            echo "idemfence@${version} is already on npm; skipping"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif ! grep -q "E404" <<<"${view}"; then
+            echo "::error::could not determine whether idemfence@${version} is on npm:"
+            echo "${view}"
+            exit 1
+          fi
+          if ! grep -qx "## ${version}" packages/idemfence/CHANGELOG.md 2>/dev/null; then
+            echo "idemfence@${version} has no CHANGELOG entry (not produced by changeset version); skipping"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "idemfence@${version} is new and has a CHANGELOG entry; staging it"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Stage publish on npm (trusted publishing)
+        if: ${{ steps.decide.outputs.publish == 'true' }}
+        working-directory: packages/idemfence
+        run: npm stage publish
+
+      - name: Extract the CHANGELOG section
+        if: ${{ steps.decide.outputs.publish == 'true' }}
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+        run: |
+          awk -v v="## ${VERSION}" '$0 == v {p=1; next} p && /^## / {exit} p' packages/idemfence/CHANGELOG.md > release-notes.md
+          cat release-notes.md
+
+      - name: Draft the GitHub release (no tag until the maintainer publishes it)
+        if: ${{ steps.decide.outputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.decide.outputs.version }}
+        run: |
+          gh release create "idemfence@${VERSION}" --draft --target "${GITHUB_SHA}" \
+            --title "idemfence@${VERSION}" --notes-file release-notes.md

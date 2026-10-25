@@ -53,6 +53,30 @@ export IDEMFENCE_TEST_DATABASE_URL=postgres://postgres:idemfence@localhost:5432/
 The tests create and drop their own schemas. Some run against the built package, so run
 `pnpm build` before `pnpm test`.
 
+## Releasing
+
+Releases go through npm's staged publishing with trusted publishing (OIDC); no npm token
+exists anywhere. The steps are:
+
+1. **Version in a normal pull request.** Run `pnpm changeset version`, which consumes the
+   pending changesets, bumps `packages/idemfence/package.json` and writes the version's
+   section in `packages/idemfence/CHANGELOG.md`. Commit it signed off and open a pull request
+   like any other change.
+2. **Merge** the pull request once it is green and reviewed.
+3. **`release.yml` runs on the push to `main`.** It publishes only when the package version is
+   not on npm yet and has a matching `CHANGELOG.md` heading, that is, it was produced by
+   `changeset version`. It then runs the artifact tests, stages the version on npm with
+   `npm stage publish`, and creates a *draft* GitHub release named `idemfence@<version>` whose
+   body is that CHANGELOG section. No tag is created yet.
+4. **The maintainer approves the staged package on npm** (`npm stage approve` or the Staged
+   Packages tab on npmjs.com), with 2FA. Only then is the version publicly installable.
+5. **The maintainer publishes the draft release**, which creates the immutable tag
+   `idemfence@<version>` (a tag ruleset blocks updating or deleting these tags).
+
+History: version 0.0.0 was published manually by the maintainer to create the package on npm,
+which trusted publishing requires. It has no CHANGELOG entry, so `release.yml` never
+publishes it. This is not part of the procedure above.
+
 ## Definition of done
 
 A pull request is ready to merge only when all of the following hold:
