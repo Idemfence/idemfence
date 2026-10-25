@@ -140,6 +140,57 @@ its answer. Keep that window short, or drain one mode before the other takes tra
 Another SQL driver can be used in place of `pg` by implementing `SqlExecutor` and a store
 that accepts it; only the Postgres store ships today.
 
+## Derived downstream keys
+
+A handler that calls another service on the request's behalf needs its own idempotency key
+for that call, one that is the same on every attempt of the same request. Otherwise a retry
+that runs the handler again (after a throw in transactional mode, a release status, a lease
+takeover, or a fail-open run) would repeat the downstream side effect. `ctx.deriveKey(label)`
+returns that key: 64 lowercase hex characters, an HMAC-SHA256 of the request's lookup key
+and the label ([contract](https://github.com/idemfence/idemfence/blob/main/docs/contract.md)
+section 5, with test vectors in Appendix A).
+
+For example, with a payment provider that accepts an `Idempotency-Key` header (Stripe is
+one; any provider with an equivalent works the same way):
+
+```ts
+const charge = idempotent(idem, { routeTemplate: "/orders/:id/pay" }, async (request, ctx) => {
+  const { amount } = await request.json();
+  const response = await fetch("https://payments.example.com/v1/charges", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${process.env.PAYMENTS_API_KEY}`,
+      "content-type": "application/json",
+      // The same on every attempt of this request, so the provider charges once.
+      "idempotency-key": await ctx.deriveKey("payment-charge"),
+    },
+    body: JSON.stringify({ amount }),
+  });
+  return Response.json(await response.json(), { status: response.ok ? 201 : 502 });
+});
+```
+
+- Use one label per downstream call (`payment-charge`, `payment-refund`, `email-receipt`):
+  1 to 128 printable ASCII characters (0x21 to 0x7E). Anything else rejects with
+  `IdemfenceDeriveError` code `DERIVE_LABEL_INVALID`.
+- A request without an `Idempotency-Key` (an optional-key route, or a method the adapter does
+  not enforce) has nothing to derive from: `ctx.deriveKey` is still there, but rejects with
+  code `DERIVE_KEY_UNAVAILABLE`.
+- Derived keys never appear in idemfence's logs or in the problem responses it generates.
+
+**Secrets and rotation.** `secret` is the current secret and `previousSecrets` the earlier
+ones, newest first and oldest last. Derived keys use the oldest configured secret: the last
+entry of `previousSecrets`, or `secret` when there are none. To rotate:
+
+1. Set the new value as `secret` and move the old one to the front of `previousSecrets`.
+   No derived key changes.
+2. Remove the last (oldest) entry of `previousSecrets` only when you mean to re-key. Every
+   derived key then changes, so a request whose attempts straddle the removal (the first
+   attempt before it, a retry after it) sends a new key to the downstream service on its
+   later attempt, and that service may perform the side effect again. Remove the oldest
+   secret when no request older than your retention can still be retried, or accept that
+   risk.
+
 ## TypeScript
 
 The public types use the Web `Request`, `Response` and `Headers` globals. A consumer with

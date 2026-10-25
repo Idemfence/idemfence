@@ -204,6 +204,36 @@ Further requirements:
 6. Every replay carries `Idempotent-Replayed: true`, and its `Content-Length` is recomputed
    from the stored body.
 
+### Derived downstream keys
+
+A handler that calls another service on the request's behalf (for example a payment
+provider) guards that side effect with a downstream key that is identical on every attempt
+of the same request (item 1). idemfence derives it from the lookup key:
+
+```
+derived key = lowercase hex( HMAC-SHA256( K, enc("idemfence/derive/v1") || enc(lookup key)
+                                             || enc(label) ) )
+```
+
+- `lookup key` is the 32 bytes of section 2, item 6. `label` names the downstream call and
+  is 1 to 128 characters, each 0x21 to 0x7E, encoded as UTF-8. Any other label MUST be
+  rejected. A request without a key has no lookup key, so asking for a derived key on it
+  MUST fail.
+- `K` is the oldest configured secret. Secrets are configured newest first: the current
+  secret, then the previous secrets from newest to oldest; `K` is the last one, or the
+  current secret when there are no previous secrets. Rotating in a new secret (the old
+  current secret moves to the front of the previous secrets) changes no derived key.
+  Removing the oldest secret changes every derived key: this is a deliberate re-key, and a
+  request whose attempts straddle the removal gets a new downstream key on its later
+  attempts.
+- Every attempt of the same request derives the same key: a retry after a throw or a release
+  status, a lease takeover (row 9), and a fail-open run (row 14), where the lookup key is
+  known even though the store is bypassed.
+- Derived keys MUST NOT appear in log entries (section 8) or in any response or problem body
+  that idemfence itself generates.
+- The tag, the encoding and the choice of `K` are observable behaviour (section 9). Test
+  vectors are in Appendix A.
+
 ## 6. Errors
 
 Every error that idemfence generates is an `application/problem+json` body
@@ -298,8 +328,8 @@ does not apply: a crashed handler's transaction rolls back and frees the key.
 Log entries emitted by idemfence carry only these fields: `keyHash` (the first 8 hex
 characters of the lookup key, absent before the key is computed), `row` (the contract row),
 `outcome` (a fixed label), `attempt` (a number), and for failures `error` (the error's name
-and, when present, code). Entries MUST NOT contain raw client keys, request or response
-bodies, header values, or error messages that may embed them.
+and, when present, code). Entries MUST NOT contain raw client keys, derived downstream keys,
+request or response bodies, header values, or error messages that may embed them.
 
 ## 9. Versioning
 
@@ -345,6 +375,25 @@ Notes:
 - In F5, `accept-language` is allowlisted but absent, and is encoded as absent.
 - In F6, the WHATWG pathname is `/orders/%7e42`.
 - Bodies are the exact bytes shown, without a trailing newline.
+
+### Derived downstream keys
+
+In every vector, `K` (the oldest configured secret) is the 46 UTF-8 bytes of
+`idemfence-derive-test-vector-secret-0123456789`. The lookup keys are those of L1 and L2.
+
+| #  | lookup key | label | derived key |
+| -- | ---------- | ----- | ----------- |
+| D1 | L1 | `payment-charge` | `c06b117ddfd327dc94cb2db75791895cabee3ee5e6e85a6d290cda873dd5c805` |
+| D2 | L1 | `payment-refund` | `06e2b2369046aa0f4017bcdcbc48cc467c16002e7e72f6b06633e042423f0ed8` |
+| D3 | L1 | `!`, then 126 × `x`, then `~` (128 characters) | `cdd7f794ac16ccf248d9432ae9caba4232c031d0360250a19f2ab142b0986a3e` |
+| D4 | L2 | `payment-charge` | `306f9287aa19352006b682010b37ccf8a4e74a02da4402aa67d4969d6a09328f` |
+
+Notes:
+
+- D1 and D2 share a lookup key and differ only in the label.
+- D3 is the longest allowed label and starts and ends with the lowest (0x21) and highest
+  (0x7E) allowed characters.
+- D1 and D4 share a label and differ only in the lookup key.
 
 ## References
 
