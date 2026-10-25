@@ -65,9 +65,17 @@ exists anywhere. The steps are:
 2. **Merge** the pull request once it is green and reviewed.
 3. **`release.yml` runs on the push to `main`.** It publishes only when the package version is
    not on npm yet and has a matching `CHANGELOG.md` heading, that is, it was produced by
-   `changeset version`. It then runs the artifact tests, stages the version on npm with
-   `npm stage publish`, and creates a *draft* GitHub release named `idemfence@<version>` whose
-   body is that CHANGELOG section. No tag is created yet.
+   `changeset version`. Its read-only `build` job runs the artifact tests and uploads the
+   packed tarball; the `publish` job (OIDC token only, GitHub environment `npm-release`,
+   restricted to `main`) verifies that tarball's sha256 and stages it with
+   `npm stage publish`; the `draft-release` job creates a *draft* GitHub release named
+   `idemfence@<version>` whose body is that CHANGELOG section. No tag is created yet.
+   The trusted publisher on npmjs.com must be configured with workflow `release.yml` and
+   environment `npm-release`.
+
+   A version that is staged but not yet approved still reads as "not on npm" (404), so a
+   rerun of the workflow for the same version fails at `npm stage publish`; that is expected.
+   Approve or reject the pending stage first.
 4. **The maintainer approves the staged package on npm** (`npm stage approve` or the Staged
    Packages tab on npmjs.com), with 2FA. Only then is the version publicly installable.
 5. **The maintainer publishes the draft release**, which creates the immutable tag
