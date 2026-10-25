@@ -3,6 +3,7 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import {
   createIdemfence,
+  type Duration,
   type HandlerContext,
   type Idemfence,
   IdemfenceConfigError,
@@ -21,6 +22,7 @@ interface Config {
   docsUrl: string;
   port: number;
   mode: RouteMode;
+  lease: Duration;
 }
 
 function readConfig(env: NodeJS.ProcessEnv): Config {
@@ -49,10 +51,23 @@ function readConfig(env: NodeJS.ProcessEnv): Config {
   if (mode !== "lease" && mode !== "transactional") {
     problems.push('IDEMFENCE_MODE must be "lease" or "transactional"');
   }
+  const lease = env.LEASE ?? "30s";
+  if (!/^[1-9]\d*(ms|s|m|h|d)$/.test(lease)) {
+    problems.push(
+      'LEASE must be a positive duration such as "2s" or "30s" (units: ms, s, m, h, d)',
+    );
+  }
   if (problems.length > 0) {
     throw new Error(`invalid configuration:\n  - ${problems.join("\n  - ")}`);
   }
-  return { databaseUrl, secret, docsUrl, port, mode: mode as RouteMode };
+  return {
+    databaseUrl,
+    secret,
+    docsUrl,
+    port,
+    mode: mode as RouteMode,
+    lease: lease as Duration,
+  };
 }
 
 // The conformance suite identifies the caller with an X-Principal header. A real application
@@ -88,6 +103,7 @@ try {
     scope,
     secret: config.secret,
     docsUrl: config.docsUrl,
+    lease: config.lease,
   });
   // The short-retention fixture (contract row 10) needs its own lease and retention.
   shortRetentionIdem = createIdemfence({
@@ -201,6 +217,24 @@ async function throwsHandler(
   throw new Error("the fixture handler always throws");
 }
 
+// The Crash group kills the app 500 ms into this handler: it writes its order at once (on
+// the pool in lease mode, where the write survives the crash; on ctx.tx in transactional
+// mode, where the crash rolls it back), then works for 1500 ms.
+async function crashHandler(
+  _request: Request,
+  ctx: HandlerContext,
+): Promise<Response> {
+  const inserted = await db(ctx).query<{ id: string }>(
+    "INSERT INTO orders (item) VALUES ($1) RETURNING id::text AS id",
+    ["crash fixture"],
+  );
+  await sleep(1500);
+  return Response.json(
+    { id: Number(inserted.rows[0]?.id), item: "crash fixture" },
+    { status: 201 },
+  );
+}
+
 async function passthroughHandler(request: Request): Promise<Response> {
   return Response.json({ echo: await request.text() });
 }
@@ -274,6 +308,12 @@ app.post("/orders", (c) => createOrder(c.req.raw));
 app.post("/fixtures/release", (c) => release(c.req.raw));
 app.post("/fixtures/throws", (c) => throws(c.req.raw));
 app.post("/fixtures/short-retention", (c) => shortRetention(c.req.raw));
+const crash = idempotent(
+  idem,
+  { routeTemplate: "/fixtures/crash", mode },
+  crashHandler,
+);
+app.post("/fixtures/crash", (c) => crash(c.req.raw));
 // Not idempotent on purpose: contract row 1 (passthrough).
 app.post("/fixtures/passthrough", (c) => passthroughHandler(c.req.raw));
 

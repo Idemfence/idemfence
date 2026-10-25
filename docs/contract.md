@@ -341,6 +341,16 @@ used for lease decisions.
   handler.
 - **Abort signal.** The handler's abort signal is not tied to the client connection: a
   client disconnect MUST NOT abort it (row 16).
+- **Crashes.** When the process holding a lease dies, nothing renews or completes the record:
+  a retry gets 409 [in-flight](#in-flight) until the lease expires on the store's clock
+  (row 8), and the first retry after that takes over (row 9) and runs the handler again.
+  At most one attempt runs at a time, and exactly one outcome is stored. Writes the dead
+  attempt made outside idemfence before it died are not undone, and the retry runs the
+  handler again, so such writes MUST be guarded downstream, for example with derived
+  downstream keys (section 5), which are the same on the retry. A process that dies after
+  the outcome was stored leaves a completed record, and the retry replays it (row 6). In
+  transactional mode the dead attempt's transaction rolls back, record included, so its
+  writes are gone and the key is free at once.
 
 **Transactional mode** (Postgres). The record is written inside the handler's own database
 transaction, so the record and the handler's writes commit or roll back together (rows 11

@@ -16,7 +16,7 @@ idemfence-conformance --url http://127.0.0.1:3000 --config target.json [--json] 
 | `--json` | Machine-readable output: `{ url, results, summary }`. |
 | `--require-all` | A scenario that was not run (missing fixture) counts as a failure. |
 | `--only` | Comma-separated contract row numbers to run; the rest are reported as skipped. |
-| `--group` | `contract` (default) or `concurrency`. |
+| `--group` | `contract` (default), `concurrency` or `crash` (runs the config's `crash.kill` and `crash.start` commands). |
 | `--iterations` | Concurrency group: number of bursts (default 1000). |
 | `--concurrency` | Concurrency group: requests per burst (default 50). |
 
@@ -55,6 +55,39 @@ response is a 409 in-flight problem with an integer `Retry-After` or a byte-iden
 with `Idempotent-Replayed: true`; and there is no 5xx and no connection error. A failing
 burst is reported with its iteration number, key prefix, status histogram and count delta.
 Connections are kept alive across bursts so a long run does not exhaust local ports.
+
+## The Crash group
+
+`--group crash` checks what a retry sees after the target dies mid-request.
+1. It sends the `crash` fixture.
+2. 500 ms later it kills the target with the config's `crash.kill` command.
+3. It restarts the target with `crash.start` and waits until `crash.readyPath` answers 200.
+4. It retries with the same key and body.
+
+**The CLI runs `crash.kill` and `crash.start` itself.** They are argv arrays run with
+`execFile`, without a shell, from the directory you start the CLI in. Only use a config
+whose commands you have read.
+
+- **Lease mode** (`crash.leaseMs` required):
+  - every retry is a 409 in-flight problem with an integer `Retry-After` until one is
+    answered otherwise;
+  - that request must be sent no later than `crash.leaseMs` plus 3000 ms (`CRASH_SLACK_MS`)
+    after the target was ready again;
+  - it must be a fresh 2xx, not a replay;
+  - between the restart and that answer the side-effect count rises by exactly 1;
+  - a further retry replays it byte for byte.
+
+  The killed attempt's own side effect survives in this mode; the output notes it.
+- **Transactional mode:**
+  - the first retry after the restart is a fresh 2xx (the killed attempt's transaction rolled
+    back);
+  - the count rises by exactly 1 over the whole scenario;
+  - a further retry replays.
+
+The `crash` fixture's handler must write its side effect at once, then work for well over
+500 ms, so the kill lands while it is running. Choose a short lease (a few seconds) for the
+target, so the 409 window is observed but ends soon. It must still be longer than the target
+takes to restart, or no 409 is seen at all.
 
 ## Side effects
 
@@ -101,6 +134,7 @@ environment, for example the reference app's compose stack, and discard it after
 | `requestBodyCap` | yes | The target's request body cap in bytes, for row 15. |
 | `keySyntax` | no | `sf-string` (default) or `sf-string-or-raw`. With raw syntax an unquoted key is valid, so row 3 does not send one. |
 | `mode` | no | `lease` (default) or `transactional`; see "Modes" above. |
+| `crash` | Crash group | `{ "kill": [argv], "start": [argv], "readyPath": "/healthz", "leaseMs": 5000 }`; see "The Crash group" above. `leaseMs` is required in lease mode. |
 | `fixtures` | no | Routes the target provides; any may be absent. A scenario that needs a missing fixture reports `not run: fixture <name> missing`. |
 
 Every fixture except `count` and `noPrincipal` has `method`, `path` and an optional JSON
@@ -116,6 +150,7 @@ Every fixture except `count` and `noPrincipal` has `method`, `path` and an optio
 | `shortRetention` | 10 | `retentionMs`: the route's retention (at least 100). The suite waits `retentionMs + 600`. |
 | `passthrough` | 1 | none; a route or method the target does not make idempotent. |
 | `noPrincipal` | 4 | `omitHeaders`: headers to leave out so the target sees no principal. |
+| `crash` | Crash group | none; the handler writes one side effect at once, then works for well over 500 ms. |
 
 The suite generates its own keys (`idemfence-conformance-<UUID>`), sent as Structured Field
 Strings, and never reuses one across rows.

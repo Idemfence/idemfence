@@ -92,6 +92,24 @@ Lease renewals that fail with a store error are logged (`renew-failed`) and retr
 next interval; fenced renewals and the hold limit are logged with outcomes `fenced` and
 `hold-limit`.
 
+### What a crash leaves behind
+
+If the process running a handler dies (killed, out of memory, power loss):
+
+- **Lease mode:** retries get a 409 until the dead attempt's lease expires (at most one
+  `lease` after its last renewal); the first retry after that runs the handler again and
+  its outcome is stored. At most one attempt runs at a time, and exactly one outcome is
+  stored. But anything the dead attempt already wrote (a row on your own connection, a
+  call to another service) is still there, and the retry runs again, so guard such writes
+  with `ctx.deriveKey`: an upsert keyed by it, or the key passed to the downstream service,
+  is the same on the retry. If the process dies after the outcome was stored, the retry
+  replays it.
+- **Transactional mode:** the dead attempt's transaction rolls back, record included, so its
+  writes through `ctx.tx` are gone and the very next retry runs the handler.
+
+The repository tests both: `packages/idemfence/test/crash.test.ts` kills a real process at
+four points of a request, and the conformance suite's Crash group kills a running service.
+
 ## Transactional mode
 
 A route with `mode: "transactional"` runs its handler inside one of the store's

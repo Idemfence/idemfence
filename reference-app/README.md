@@ -22,6 +22,7 @@ These routes exist for the conformance suite (`packages/conformance`) and stay p
 | `POST /fixtures/release` | Idempotent; always answers `429` (a release status), so the key stays reusable (row 11). In transactional mode it first inserts an order through `ctx.tx`, which the release rolls back. |
 | `POST /fixtures/throws` | Idempotent; the handler throws (row 12 in lease mode, row 13 in transactional mode). In transactional mode it first inserts an order through `ctx.tx`, which the throw rolls back. |
 | `POST /fixtures/short-retention` | Idempotent with a 500 ms lease and 1.5 s retention; same body and effect as `POST /orders` (row 10). |
+| `POST /fixtures/crash` | Idempotent; inserts an order at once (on the pool in lease mode, on `ctx.tx` in transactional mode), then works for 1500 ms, so the Crash group can kill the app mid-request. |
 | `POST /fixtures/passthrough` | Not idempotent; echoes the body (row 1). |
 | `POST /nonconforming/{orders,release,throws,short-retention,passthrough}` | The same handlers **without idemfence**, so the suite can be shown failing. Never do this in a real application. |
 
@@ -34,6 +35,16 @@ non-conforming group:
 node ../packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config conformance.json --require-all
 node ../packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config conformance.transactional.json --require-all   # IDEMFENCE_MODE=transactional
 node ../packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config conformance.nonconforming.json   # exits 1
+```
+
+Both configs also carry a `crash` section for the Crash group. Its `kill` and `start`
+commands are `docker compose -f reference-app/compose.yaml kill -s SIGKILL app` and
+`docker compose -f reference-app/compose.yaml start app`. Run that group from the
+repository root, with the stack started with `LEASE=5s` (it matches `crash.leaseMs`) and the
+compose variables (`POSTGRES_PASSWORD`, `IDEMFENCE_SECRET`) in the environment:
+
+```sh
+node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config reference-app/conformance.json --group crash
 ```
 
 ### The principal
@@ -59,6 +70,7 @@ a message listing every problem.
 | `DOCS_URL` | yes | `https://` URL of your published idempotency documentation; problem `type` URIs point into it. |
 | `PORT` | yes | Port to listen on (1–65535). |
 | `IDEMFENCE_MODE` | no | `lease` (default) or `transactional`: the mode of every idempotent route. compose passes `lease` unless it is set. |
+| `LEASE` | no | Lease of the idempotent routes, a duration such as `5s` (default `30s`). The Crash group needs a short one that matches `crash.leaseMs` in the conformance config (CI uses `5s`). |
 
 With compose, `POSTGRES_PASSWORD` is also required; `.env.example` lists them all. Copy it
 to `.env` and fill in the secrets. Never commit `.env`.

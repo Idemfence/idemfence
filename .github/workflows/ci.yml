@@ -130,6 +130,9 @@ jobs:
     env:
       # Read by compose.yaml.
       IDEMFENCE_MODE: ${{ matrix.mode }}
+      # A short lease for the Crash group; it matches crash.leaseMs in conformance.json. With
+      # a 2 s lease the app took longer to restart than the lease lasted, so no 409 was seen.
+      LEASE: 5s
       CONFORMANCE_CONFIG: ${{ matrix.mode == 'transactional' && 'reference-app/conformance.transactional.json' || 'reference-app/conformance.json' }}
     steps:
       - name: Check out
@@ -182,6 +185,11 @@ jobs:
       - name: Conformance, Concurrency group (1000 x 50)
         run: node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config "$CONFORMANCE_CONFIG" --group concurrency
 
+      # Kills the app service with SIGKILL mid-request and starts it again
+      # (crash.kill and crash.start in the config), then retries.
+      - name: Conformance, Crash group
+        run: node packages/conformance/dist/cli.js --url http://127.0.0.1:3000 --config "$CONFORMANCE_CONFIG" --group crash
+
       - name: Show logs on failure
         if: ${{ failure() }}
         run: docker compose -f reference-app/compose.yaml logs --no-color
@@ -189,6 +197,62 @@ jobs:
       - name: Tear down
         if: ${{ always() }}
         run: docker compose -f reference-app/compose.yaml down -v
+
+  # The white-box crash group at length: 25 rounds per kill point and mode (200 rounds),
+  # where the check job runs the default 3.
+  crash:
+    name: crash
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        # postgres:18.4, pushed 2026-08-06; pinned by manifest-list digest.
+        image: postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+        env:
+          POSTGRES_USER: idemfence
+          POSTGRES_PASSWORD: idemfence
+          POSTGRES_DB: idemfence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U idemfence -d idemfence_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      IDEMFENCE_TEST_DATABASE_URL: postgres://idemfence:idemfence@localhost:5432/idemfence_test
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The child processes run the built package.
+      - name: Build
+        run: pnpm build
+
+      - name: Crash group, 25 rounds per point and mode
+        env:
+          CRASH_ROUNDS: "25"
+          CRASH_SUMMARY: crash-summary.json
+        run: |
+          started=$(date +%s)
+          pnpm exec vitest run packages/idemfence/test/crash.test.ts
+          echo "crash group wall time: $(( $(date +%s) - started )) s"
+
+      - name: Observed counts per point and mode
+        if: ${{ always() }}
+        run: cat crash-summary.json || true
 
   # Mirrors release.yml's three jobs without the OIDC token: the stage is a --dry-run of the
   # uploaded tarball and no release is created.
@@ -348,6 +412,7 @@ jobs:
         licenses,
         audit,
         reference-app,
+        crash,
         release-dry-run-build,
         release-dry-run-stage,
         release-dry-run-notes,

@@ -43,6 +43,7 @@ services:
       IDEMFENCE_SECRET: ${IDEMFENCE_SECRET:?set IDEMFENCE_SECRET (see .env.example)}
       DOCS_URL: ${DOCS_URL:-https://github.com/idemfence/idemfence/blob/main/docs/contract.md}
       IDEMFENCE_MODE: ${IDEMFENCE_MODE:-lease}
+      LEASE: ${LEASE:-30s}
       PORT: "3000"
     ports:
       - "${PORT:-3000}:3000"

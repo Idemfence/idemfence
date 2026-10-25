@@ -61,6 +61,35 @@
     },
     "noPrincipal": {
       "omitHeaders": ["X-Principal"]
+    },
+    "crash": {
+      "method": "POST",
+      "path": "/fixtures/crash",
+      "body": {
+        "item": "crash"
+      }
     }
+  },
+  "crash": {
+    "kill": [
+      "docker",
+      "compose",
+      "-f",
+      "reference-app/compose.yaml",
+      "kill",
+      "-s",
+      "SIGKILL",
+      "app"
+    ],
+    "start": [
+      "docker",
+      "compose",
+      "-f",
+      "reference-app/compose.yaml",
+      "start",
+      "app"
+    ],
+    "readyPath": "/healthz",
+    "leaseMs": 5000
   }
 }
