@@ -105,9 +105,9 @@ Rules for `ctx.tx`:
   in a savepoint.
 - It is dead once the transaction ends: a query on it after the response was committed or
   rolled back rejects at once with `IdemfenceStoreError` code `TRANSACTION_ENDED` and never
-  reaches the pooled connection, which may already serve another request. A response body
-  over `responseBodyCap` is streamed to the client after `COMMIT`, so it must not read from
-  `ctx.tx`.
+  reaches the pooled connection, which may already serve another request. Finish every
+  query before returning: a response body that streams after `COMMIT` (one over
+  `responseBodyCap`, or any body on a request without a key) must not read from `ctx.tx`.
 - On an optional-key route (`required: false`), a request without a key runs the handler in
   a plain transaction with no record: committed when the handler returns, rolled back when
   it throws.

@@ -350,22 +350,9 @@ export function resolveRoute<TRequest>(
       "Route option `routeTemplate` must be 1 to 2048 printable ASCII characters starting with `/`.",
     );
   }
-  const mode = routeMode(config.store, route.mode);
-  const failOpen = booleanOption(
-    "failOpen",
-    "ROUTE_FLAG_INVALID",
-    route.failOpen,
-    false,
-  );
-  if (failOpen && mode === "transactional") {
-    throw new IdemfenceConfigError(
-      "FAIL_OPEN_TRANSACTIONAL",
-      'Route options `failOpen: true` and `mode: "transactional"` cannot be combined: fail-open runs the handler without the store, and a transactional handler runs inside the store\'s transaction.',
-    );
-  }
-  return Object.freeze({
+  const resolved: ResolvedRoute = {
     routeTemplate: template,
-    mode,
+    mode: routeMode(config.store, route.mode),
     required: booleanOption(
       "required",
       "REQUIRED_INVALID",
@@ -409,8 +396,20 @@ export function resolveRoute<TRequest>(
       route.allowSetCookieReplay,
       false,
     ),
-    failOpen,
-  });
+    failOpen: booleanOption(
+      "failOpen",
+      "ROUTE_FLAG_INVALID",
+      route.failOpen,
+      false,
+    ),
+  };
+  if (resolved.failOpen && resolved.mode === "transactional") {
+    throw new IdemfenceConfigError(
+      "FAIL_OPEN_TRANSACTIONAL",
+      'Route options `failOpen: true` and `mode: "transactional"` cannot be combined: fail-open runs the handler without the store, and a transactional handler runs inside the store\'s transaction.',
+    );
+  }
+  return Object.freeze(resolved);
 }
 
 /**

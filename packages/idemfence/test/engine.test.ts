@@ -1250,6 +1250,9 @@ describe("handler context: tx", () => {
   it("transactional mode: ctx.tx runs inside a transaction that commits with the handler", async () => {
     const key = freshKey();
     const id = `order-${key}`;
+    const connectionDefault = (
+      await pool.query<{ lock_timeout: string }>("SHOW lock_timeout")
+    ).rows[0]?.lock_timeout;
     const response = await engine.handle(
       req(key, { body: "{}" }),
       TX_ROUTE,
@@ -1267,7 +1270,7 @@ describe("handler context: tx", () => {
         const shown = await ctx.tx.query<{ lock_timeout: string }>(
           "SHOW lock_timeout",
         );
-        expect(shown.rows[0]?.lock_timeout).toBe("0");
+        expect(shown.rows[0]?.lock_timeout).toBe(connectionDefault);
         // Not yet committed: another connection cannot see it.
         expect(await orderRow(id)).toBe(0);
         return created();

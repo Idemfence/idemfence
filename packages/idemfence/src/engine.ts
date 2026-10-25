@@ -64,8 +64,9 @@ export interface TransactionalHandlerContext {
    *   Use a savepoint around a statement that may fail.
    * - It is dead once the transaction ends: a query after the handler's response has been
    *   committed or rolled back rejects at once with `IdemfenceStoreError` code
-   *   `TRANSACTION_ENDED`. A response body over `responseBodyCap` is streamed to the client
-   *   after `COMMIT`, so it must not read from `ctx.tx`.
+   *   `TRANSACTION_ENDED`. Finish every query before returning: a response body that
+   *   streams after `COMMIT` (over `responseBodyCap`, or any body on a request without a
+   *   key) must not read from `ctx.tx`.
    */
   readonly tx: SqlExecutor;
 }
@@ -377,12 +378,10 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       return notAcquired(route, begun);
     }
 
-    let response: Response;
-    try {
-      response = await handler(request, { tx: transaction.executor });
-    } catch (error) {
-      // Row 13: the record rolls back with the handler's writes, so the key is free and a
-      // retry runs the handler again.
+    // Row 13: the record rolls back with the handler's writes, so the key is free and a
+    // retry runs the handler again. A response body that fails while it is read counts as
+    // the handler throwing.
+    const threw = async (error: unknown): Promise<Response> => {
       await rollback(transaction, keyHash, 13);
       logger.error(
         "idemfence: handler threw; its writes and the record were rolled back, nothing stored",
@@ -394,6 +393,13 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
         },
       );
       return internalProblemResponse();
+    };
+
+    let response: Response;
+    try {
+      response = await handler(request, { tx: transaction.executor });
+    } catch (error) {
+      return threw(error);
     }
 
     // Row 11: the handler's writes and the record roll back together; the key is free.
@@ -407,8 +413,7 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
     try {
       captured = await capture(response, route, keyHash);
     } catch (error) {
-      await rollback(transaction, keyHash, 12);
-      throw error;
+      return threw(error);
     }
     let completed: "completed" | "fenced";
     try {
@@ -474,7 +479,12 @@ export function createEngine(config: ResolvedConfig<Request>): Engine {
       await rollback(transaction, undefined, 1);
       throw error;
     }
-    await transaction.commit();
+    try {
+      await transaction.commit();
+    } catch (error) {
+      cancelBody(response);
+      throw error;
+    }
     return response;
   }
 

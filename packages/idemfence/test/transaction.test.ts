@@ -417,12 +417,15 @@ describe("postgresStore.openTransaction", () => {
     expect(configured.lockTimeoutMs).toBe(750);
     expect(store.lockTimeoutMs).toBe(250);
     const k = key();
+    const connectionDefault = (
+      await pool.query<{ lock_timeout: string }>("SHOW lock_timeout")
+    ).rows[0]?.lock_timeout;
     const transaction = await configured.openTransaction();
     const tx = transaction.executor;
     const shown = async () =>
       (await tx.query<{ lock_timeout: string }>("SHOW lock_timeout")).rows[0]
         ?.lock_timeout;
-    expect(await shown()).toBe("0");
+    expect(await shown()).toBe(connectionDefault);
     await tx.query("SET LOCAL lock_timeout = '3s'");
     const begun = await configured.begin(k, fp, 5_000, 60_000, tx);
     expect(begun.outcome).toBe("acquired");

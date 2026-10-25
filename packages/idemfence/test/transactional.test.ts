@@ -227,9 +227,16 @@ async function record(
   return result.rows[0];
 }
 
-/** Resolves once `n` sessions are waiting on a lock in a statement on this file's records. */
+/**
+ * Resolves once `n` sessions are waiting on a lock in a statement on this file's records;
+ * rejects with a clear message if that never happens.
+ */
 async function lockWaiters(n: number): Promise<void> {
+  const deadline = Date.now() + 4_000;
   for (;;) {
+    if (Date.now() > deadline) {
+      throw new Error(`no ${n} lock waiter(s) on ${records} within 4 s`);
+    }
     const result = await observer.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM pg_stat_activity
        WHERE wait_event_type = 'Lock' AND position($1 IN query) > 0`,
@@ -860,6 +867,84 @@ describe("transactional mode: configuration (T8)", () => {
         async () => new Response("never"),
       ),
     ).rejects.toMatchObject({ code: "FAIL_OPEN_TRANSACTIONAL" });
+  });
+});
+
+describe("transactional mode: failures while ending the handler", () => {
+  it("a response body that fails while it is read counts as a throw (row 13)", async () => {
+    const tag = freshTag();
+    let calls = 0;
+    const path = mount(
+      idemfence(postgresStore({ pool, schema })),
+      async (_request, ctx) => {
+        calls += 1;
+        await insertOrder(ctx.tx, tag);
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("partial"));
+            controller.error(new Error("the body failed"));
+          },
+        });
+        return new Response(body, { status: 201 });
+      },
+    );
+    const key = freshKey();
+    const mark = logs.length;
+    expectProblem(await post(path, key), 500, "about:blank");
+    expect(logs.slice(mark)).toEqual([
+      expect.objectContaining({
+        fields: expect.objectContaining({ row: 13, outcome: "handler-error" }),
+      }),
+    ]);
+    expect(await orderCount(tag)).toBe(0);
+    expect(await record(key, path)).toBeUndefined();
+    expectProblem(await post(path, key), 500, "about:blank");
+    expect(calls).toBe(2);
+  });
+
+  it("a failed ROLLBACK destroys the connection, is logged, and does not change the response", async () => {
+    const own = newPool({ max: 1 });
+    const tag = freshTag();
+    const path = mount(
+      idemfence(postgresStore({ pool: own, schema })),
+      async (_request, ctx) => {
+        await insertOrder(ctx.tx, tag);
+        const pid = (
+          await ctx.tx?.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+        )?.rows[0]?.pid;
+        // Returns once the backend is gone, so the engine's ROLLBACK has no server.
+        await observer.query("SELECT pg_terminate_backend($1, 5000)", [pid]);
+        throw new Error("after losing the connection");
+      },
+    );
+    const key = freshKey();
+    const mark = logs.length;
+    expectProblem(await post(path, key), 500, "about:blank");
+    const entries = logs.slice(mark);
+    expect(entries).toHaveLength(2);
+    expect(entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          level: "error",
+          fields: expect.objectContaining({
+            row: 13,
+            outcome: "rollback-failed",
+          }),
+        }),
+        expect.objectContaining({
+          fields: expect.objectContaining({
+            row: 13,
+            outcome: "handler-error",
+          }),
+        }),
+      ]),
+    );
+    expect({ total: own.totalCount, idle: own.idleCount }).toEqual({
+      total: 0,
+      idle: 0,
+    });
+    expect(await orderCount(tag)).toBe(0);
+    expect(await record(key, path)).toBeUndefined();
   });
 });
 
